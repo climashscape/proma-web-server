@@ -9,5 +9,8 @@
     "build:web-preload": "bun run web/build-web-preload.ts && bun run web/build-preload-bundle.ts",
     "smoke:browser": "bun run browser-smoke.ts"
   },
+  "devDependencies": {
+    "playwright": "^1.62.1"
+  },
   "description": "Proma Web 服务化阶段 1 PoC：Bun HTTP + WebSocket IPC 桥"
 }

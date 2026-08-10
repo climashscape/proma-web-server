@@ -95,7 +95,7 @@ async function main(): Promise<void> {
     const expectOk = t.expectOk ?? true
     const ok = r.ok === expectOk
     const tag = r.ok ? '✅' : t.expectOk === false ? '⚠️' : '❌'
-    const summary = r.ok ? JSON.stringify(r.result).slice(0, 100) : r.error
+    const summary = r.ok ? (r.result === undefined ? '(result: undefined)' : JSON.stringify(r.result).slice(0, 100)) : r.error
     console.log(`${tag} ${t.channel}${t.note ? ` [${t.note}]` : ''}${summary ? ` — ${summary}` : ''}`)
     if (!ok) failures++
   }

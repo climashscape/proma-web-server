@@ -52,6 +52,14 @@ async function main(): Promise<void> {
   await mkdir(OUT_DIR, { recursive: true })
 
   try {
+    // 生成时间戳：默认固定 'unknown'（产物可复现，git 无噪音）；设置 PROMA_WEB_BUILD_TS 可写入实际时间（如 install.sh 传 date +%Y%m%d）
+    const buildTs = process.env.PROMA_WEB_BUILD_TS || 'unknown'
+    const banner = `// ============================================================================
+// ⚠️ 本文件由 build-preload-bundle.ts 自动生成，请勿手工编辑（上游更新时重新生成）
+// 生成时间: ${buildTs}（默认固定，设置 PROMA_WEB_BUILD_TS 写入实际时间戳）
+// 来源: web/preload.ts（由 build-web-preload.ts 从 Proma preload/index.ts 转换）
+// 说明: 浏览器端 electronAPI（WS IPC 桥），含 Web 模式降级（剪贴板/文件选择/连接状态）
+// ============================================================================\n`
     const result = await Bun.build({
       entrypoints: [ENTRY],
       outdir: OUT_DIR,
@@ -59,6 +67,7 @@ async function main(): Promise<void> {
       format: 'iife',
       target: 'browser',
       sourcemap: 'none',
+      banner,
       plugins: [promaSrcRedirect],
     })
     if (!result.success) {

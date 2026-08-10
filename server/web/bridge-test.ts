@@ -13,8 +13,11 @@
  */
 
 // ---- 浏览器环境 shim（在 import bridge 之前设置）----
+// host 支持 PROMA_WEB_WS 覆盖（如 ws://127.0.0.1:6900/ws），与 client-test 一致
+const TEST_WS = process.env.PROMA_WEB_WS || 'ws://127.0.0.1:6810/ws'
+const testHost = TEST_WS.replace(/^wss?:\/\//, '').split('/')[0] || '127.0.0.1:6810'
 ;(globalThis as any).location = {
-  host: '127.0.0.1:6810',
+  host: testHost,
   protocol: 'http:',
   search: '',
 }
@@ -49,6 +52,14 @@ try {
 } catch (e) {
   check('bridge 连接 server + ready', false, String(e))
   process.exit(1)
+}
+// 1b. ready 帧协议字段：maxMsgBytes 应存在且 >0（服务端下发，客户端预检依赖）
+try {
+  // 通过公开 getter 校验服务端下发值已生效
+  const max = ipcRenderer.maxMsgBytes
+  check('ready 帧下发 maxMsgBytes（服务端消息上限）', typeof max === 'number' && max > 0, `maxMsgBytes=${max}`)
+} catch (e) {
+  check('ready 帧下发 maxMsgBytes（服务端消息上限）', false, String(e))
 }
 
 // 2. invoke 真实 handler

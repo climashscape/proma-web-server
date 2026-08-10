@@ -124,7 +124,7 @@ async function main() {
         ]
     for (const t of targets) {
       const r = await invoke(t.channel, t.args)
-      check(`invoke ${t.channel}`, r.ok, r.ok ? `→ ${JSON.stringify(r.result).slice(0, 120)}` : r.error)
+      check(`invoke ${t.channel}`, r.ok, r.ok ? `→ ${r.result === undefined ? '(result: undefined)' : JSON.stringify(r.result).slice(0, 120)}` : r.error)
     }
 
     // 3. 未知通道

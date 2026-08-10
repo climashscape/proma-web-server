@@ -34,7 +34,8 @@ if [ ! -d "$PROMA_SRC/apps/electron/src/main" ]; then
 fi
 
 STUB_DIR="${STUB_DIR:-$REPO_ROOT/server/packages/electron-stub}"
-BACKUP_DIR="${BACKUP_DIR:-$REPO_ROOT/.patch-backup}"
+# 备份目录按 PROMA_SRC 哈希分目录：多实例（/opt/Proma 与开发目录）互不覆盖，undo 各还原各的
+BACKUP_DIR="${BACKUP_DIR:-$REPO_ROOT/.patch-backup/$(printf '%s' "$PROMA_SRC" | cksum | cut -d' ' -f1)}"
 SRC_MAIN="$PROMA_SRC/apps/electron/src/main"
 LINK_TARGET="$PROMA_SRC/node_modules/@proma/electron-stub"
 
@@ -96,7 +97,12 @@ case "$ACTION" in
       echo "已创建链接 $LINK_TARGET → $STUB_DIR"
     fi
     echo "剩余 'electron' import（应只剩 @proma/electron-stub）："
-    find_targets | wc -l
+    remaining=$(find_targets | wc -l)
+    echo "$remaining"
+    if [ "$remaining" -gt 0 ]; then
+      echo "❌ 仍有 $remaining 个文件残留 'electron' import（多行 import 或新 require 形态），patch 未完全生效"
+      exit 1
+    fi
     ;;
   undo)
     echo "=== patch-proma undo ==="
@@ -129,6 +135,10 @@ case "$ACTION" in
     echo "仍 import 'electron' 的文件数: $remaining"
     patched=$(grep -rl "@proma/electron-stub" "$SRC_MAIN" --include='*.ts' 2>/dev/null | wc -l)
     echo "已 import '@proma/electron-stub' 的文件数: $patched"
+    # 生效判据：链接存在 ≠ 内容已替换（git checkout 可能清掉替换内容而残留链接）
+    if [ -L "$LINK_TARGET" ] && [ "$patched" -eq 0 ]; then
+      echo "⚠️ 链接存在但无文件 import '@proma/electron-stub'：内容未替换（可能被 git checkout 清掉），请重新 apply"
+    fi
     ;;
   *)
     echo "用法: $0 apply|undo|status"

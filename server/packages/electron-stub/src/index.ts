@@ -88,10 +88,20 @@ export const ipcMain = {
   on(channel: string, fn: (...args: unknown[]) => void) {
     if (!onHandlers.has(channel)) onHandlers.set(channel, new Set())
     onHandlers.get(channel)!.add(fn)
+    // Web 模式降级声明：on/once 通道无路由（上游调用方均为 Electron 特有场景，如 beforeunload/语音听写），
+    // 注册即死通道；仅提示一次避免刷日志
+    if (onHandlers.get(channel)!.size === 1) {
+      console.warn(`[stub] ipcMain.on('${channel}') 已注册但 Web 模式不路由（Electron 专属通知通道）`)
+    }
     return ipcMain
   },
   once(channel: string, fn: (...args: unknown[]) => void) {
-    return ipcMain.on(channel, fn)
+    // 对齐 Electron once 语义：首次触发后自动移除
+    const wrapped = (...args: unknown[]) => {
+      onHandlers.get(channel)?.delete(wrapped)
+      fn(...args)
+    }
+    return ipcMain.on(channel, wrapped as (...args: unknown[]) => void)
   },
   removeHandler(channel: string) {
     invokeHandlers.delete(channel)
@@ -110,6 +120,31 @@ export const ipcMain = {
 const USER_DATA_DIR = process.env.PROMA_WEB_USER_DATA || join(homedir(), '.proma-web')
 const LOGS_DIR = join(USER_DATA_DIR, 'logs')
 const SESSION_DATA_DIR = join(USER_DATA_DIR, 'session-data')
+
+/** 动态解析上游 Proma 版本：PROMA_WEB_PROMA_VERSION 环境变量 > PROMA_SRC/package.json > 未知占位 */
+let cachedPromaVersion: string | null = null
+function resolvePromaVersion(): string {
+  if (cachedPromaVersion) return cachedPromaVersion
+  const fromEnv = process.env.PROMA_WEB_PROMA_VERSION
+  if (fromEnv) {
+    cachedPromaVersion = fromEnv
+    return fromEnv
+  }
+  try {
+    const src = process.env.PROMA_SRC
+    if (src) {
+      const pkg = JSON.parse(readFileSync(join(src, 'package.json'), 'utf8')) as { version?: string }
+      if (pkg?.version) {
+        cachedPromaVersion = String(pkg.version)
+        return cachedPromaVersion
+      }
+    }
+  } catch {
+    /* fallthrough */
+  }
+  cachedPromaVersion = '0.0.0-unknown'
+  return cachedPromaVersion
+}
 
 const APP_PATHS: Record<string, string> = {
   home: homedir(),
@@ -134,7 +169,7 @@ export const app = {
   isPackaged: false,
   isReady: () => true,
   getName: () => 'Proma',
-  getVersion: () => '0.16.38',
+  getVersion: () => resolvePromaVersion(),
   getLocale: () => 'zh-CN',
   getPath: (name: string) => APP_PATHS[name] ?? USER_DATA_DIR,
   setPath: (_name: string, _path: string) => {},
@@ -205,8 +240,13 @@ export class BrowserWindow {
   show = () => {}
   hide = () => {}
   focus = () => {}
-  close = () => {}
-  destroy = () => {}
+  close = () => {
+    // Web 模式无真实窗口：close 视为销毁（移出 getAllWindows 集合）
+    _windows.delete(this)
+  }
+  destroy = () => {
+    _windows.delete(this)
+  }
   minimize = () => {}
   maximize = () => {}
   unmaximize = () => {}
@@ -436,7 +476,8 @@ export const systemPreferences = {
 }
 
 export class Notification {
-  static isSupported = () => true
+  // Web 模式无系统通知：声明不支持，避免官方 renderer 走"已通知"假成功分支
+  static isSupported = () => false
   constructor(_opts?: unknown) {}
   show = () => {}
   close = () => {}
