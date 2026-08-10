@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Proma Web · 阶段 1 PoC</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: system-ui, sans-serif; background: #111; color: #ddd; margin: 0; padding: 24px; }
+    h1 { font-size: 20px; }
+    .card { background: #1b1b1f; border: 1px solid #333; border-radius: 12px; padding: 16px 20px; margin: 12px 0; }
+    .ok { color: #4ade80; }
+    .err { color: #f87171; }
+    pre { background: #0c0c0e; padding: 12px; border-radius: 8px; overflow: auto; font-size: 12px; }
+    button { background: #2f6feb; border: 0; color: #fff; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #3b7dff; }
+    .muted { color: #888; font-size: 13px; }
+    #log { max-height: 300px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>Proma Web · 阶段 1 PoC</h1>
+  <div class="card">
+    <div>WebSocket IPC 桥状态：<span id="state" class="muted">连接中…</span></div>
+    <div class="muted" id="channels"></div>
+  </div>
+  <div class="card">
+    <button id="btn-status">runtime:get-status</button>
+    <button id="btn-channels">channel:list</button>
+    <button id="btn-settings">settings:get</button>
+  </div>
+  <div class="card">
+    <div class="muted">响应 / 事件日志</div>
+    <pre id="log"></pre>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id)
+    const logEl = $('log')
+    function log(text, cls) {
+      logEl.textContent += `[${new Date().toLocaleTimeString()}] ${text}\n`
+      logEl.scrollTop = logEl.scrollHeight
+    }
+
+    const token = new URLSearchParams(location.search).get('token')
+    if (!token) {
+      $('state').textContent = '缺少 token（请在 URL 加 ?token=xxx）'
+      $('state').className = 'err'
+      return
+    }
+    const ws = new WebSocket(`ws://${location.host}/ws?token=${encodeURIComponent(token)}`)
+    let nextId = 1
+    const pending = new Map()
+
+    ws.onopen = () => { $('state').textContent = '已连接 ✅'; $('state').className = 'ok'; log('WS 已连接') }
+    ws.onclose = () => { $('state').textContent = '已断开 ❌'; $('state').className = 'err'; log('WS 断开') }
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data)
+      if (msg.type === 'ready') {
+        $('channels').textContent = `已注册 ${msg.channels.length} 个 handler 通道`
+        log(`握手成功，通道数 ${msg.channels.length}`)
+      } else if (msg.type === 'result') {
+        const p = pending.get(msg.id)
+        if (p) { pending.delete(msg.id); p(msg) }
+      } else if (msg.type === 'event') {
+        log(`← 事件 ${msg.channel} ${JSON.stringify(msg.payload).slice(0, 150)}`)
+      }
+    }
+
+    function invoke(channel) {
+      const id = nextId++
+      log(`→ invoke ${channel}`)
+      const p = new Promise((res) => pending.set(id, res))
+      ws.send(JSON.stringify({ type: 'invoke', id, channel, args: [] }))
+      p.then((m) => {
+        if (m.ok) log(`✅ ${channel} → ${JSON.stringify(m.result).slice(0, 400)}`, 'ok')
+        else log(`❌ ${channel} → ${m.error?.slice(0, 300)}`, 'err')
+      })
+    }
+
+    $('btn-status').onclick = () => invoke('runtime:get-status')
+    $('btn-channels').onclick = () => invoke('channel:list')
+    $('btn-settings').onclick = () => invoke('settings:get')
+  </script>
+</body>
+</html>

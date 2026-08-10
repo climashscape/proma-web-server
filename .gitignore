@@ -1,0 +1,30 @@
+# dependencies
+node_modules/
+
+# patch 备份（patch-proma.sh 默认 BACKUP_DIR）
+.patch-backup/
+
+# build artifacts（preload.ts 可重建；assets 27M 建议保留，若仓库限流则 ignore 并在 README 说明构建）
+server/web/preload.ts
+# server/public/assets/          # 27M，GitHub 单文件<100M 可直接提交；如要精简可打开本行并在 README 写明构建方式
+
+# secrets & local config
+*.env
+.env.*
+!*.env.example
+.safe-key
+channels.json
+**/.proma-dev/
+.proma-web-token
+*.bak-*
+
+# OS & editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# logs / tmp
+*.log
+/tmp/

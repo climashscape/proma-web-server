@@ -1,0 +1,13 @@
+{
+  "name": "@proma/electron-stub",
+  "version": "0.1.0",
+  "description": "Proma Web 服务化：纯 Bun/Node 环境下的 Electron API stub（替代 import 'electron'）",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./node-sqlite-shim": "./node-sqlite-shim.ts"
+  },
+  "license": "AGPL-3.0",
+  "private": true
+}

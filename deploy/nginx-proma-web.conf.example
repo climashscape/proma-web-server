@@ -1,0 +1,15 @@
+# Proma Web Server nginx 反代示例（★必须用 $http_host，不能用 $host）
+# $host 会被规范化丢失端口 → server origin 校验 403 → WS 连不上
+server {
+    listen 0.0.0.0:6811;   # 对外端口，可改
+
+    location / {
+        proxy_pass http://127.0.0.1:6810;   # 后端 Bun server（与 server 默认端口一致）
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $http_host;   # ★ 关键：保留原始 Host（含端口）
+        proxy_read_timeout 3600s;
+        proxy_buffering off;
+    }
+}

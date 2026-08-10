@@ -1,0 +1,58 @@
+# Proma Web Server systemd unit 模板（M5 部署衔接）
+#
+# 适用：Linux 主机 / NAS（飞牛 fpk 打包见阶段 5，此处为通用 systemd 方案）
+# 使用：
+#   1. 拷贝 server-test 到部署目录（如 /opt/proma-web）
+#   2. 替换下面环境变量占位符
+#   3. sudo cp deploy/proma-web.service /etc/systemd/system/
+#   4. sudo systemctl daemon-reload && sudo systemctl enable --now proma-web
+#
+# 注意：NAS 部署建议改用 fpk（run-as root + runuser 切换 <app-user>，见
+#       docs/飞牛OS-应用打包SOP.md）；本 unit 是独立主机/调试环境的衔接模板。
+
+[Unit]
+Description=Proma Web Server (WS IPC bridge for Proma Web 化)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 数据目录归属用户（如 NAS 上为 <app-user>；本机开发可为当前用户）
+User=__RUN_USER__
+Group=__RUN_GROUP__
+WorkingDirectory=/opt/proma-web
+
+# ---- 必填 ----
+Environment=PROMA_WEB_TOKEN=__CHANGE_ME_RANDOM_TOKEN__
+# 局域网访问必须 0.0.0.0；仅本机可保持 127.0.0.1
+Environment=PROMA_WEB_HOST=0.0.0.0
+Environment=PROMA_WEB_PORT=6810
+Environment=PROMA_SRC=__PROMA_SRC__
+# 数据目录：NAS 用 /vol1/@appdata/proma；独立主机可用 ~/.proma-web
+Environment=PROMA_WEB_USER_DATA=__DATA_DIR__
+# 可选：安全密钥（不设置则自动持久化到 <userData>/.safe-key）
+# Environment=PROMA_WEB_SAFE_KEY=__SAFE_KEY__
+
+# ---- 日志/限制 ----
+Environment=PROMA_WEB_LOG_LEVEL=info
+Environment=PROMA_WEB_MAX_MSG_BYTES=4194304
+Environment=PROMA_WEB_INVOKE_TIMEOUT_MS=120000
+Environment=PROMA_WEB_RATE_LIMIT=600
+
+# ---- 运行 ----
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/bun run server.ts
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# ---- 安全加固（按需裁剪）----
+# M8：ProtectHome=true 会隐藏 /root，而 stub 的 app.getPath('home') 等依赖 homedir()；
+# 若数据目录在 /vol1 或独立路径且无需 home，可保持 true；否则设 false。
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=__DATA_DIR__
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
