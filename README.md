@@ -26,7 +26,7 @@ Bun server (127.0.0.1:6810)
 
 ## 快速部署
 ```bash
-git clone https://github.com/aij2022/proma-web-server.git
+git clone https://github.com/Aij2022/proma-web-server.git
 cd proma-web-server
 sudo bash deploy/install.sh
 ```
