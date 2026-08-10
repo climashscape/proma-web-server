@@ -18,7 +18,7 @@
  *  - /health 健康检查 + /metrics 轻量指标
  */
 
-import { join, extname, resolve, dirname } from 'node:path'
+import { join, extname, resolve, dirname, sep } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
@@ -34,7 +34,7 @@ import {
   type InvokeFrame,
 } from './protocol'
 
-// ===================== 配置（环境变量，.env.example 见仓库根） =====================
+// ===================== 配置（环境变量，.env.example 见 server/.env.example） =====================
 
 const PORT = Number(process.env.PROMA_WEB_PORT || 6810)
 const HOST = process.env.PROMA_WEB_HOST || '127.0.0.1'
@@ -86,10 +86,42 @@ function originAllowed(req: Request): boolean {
   }
 }
 const connAttempts = new Map<string, number[]>()
+// connAttempts 条目上限（防御：TRUST_PROXY=1 时伪造 XFF 可注入海量 key 导致内存增长；
+// 超限时直接清空（限频是尽力而为的防护，清空后窗口重置可接受））
+const CONN_ATTEMPTS_MAX_KEYS = 10_000
+
+/** 可信反代模式（PROMA_WEB_TRUST_PROXY=1）：优先取 X-Forwarded-For 首个 IP（仅限可信反代，否则可伪造） */
+const TRUST_PROXY = process.env.PROMA_WEB_TRUST_PROXY === '1'
+
+function clientIp(req: Request, srv: { requestIP(req: Request): { address: string } | null }): string {
+  if (TRUST_PROXY) {
+    const xff = req.headers.get('x-forwarded-for')
+    if (xff) {
+      const first = xff.split(',')[0]?.trim()
+      if (first) return first
+    }
+  }
+  return srv.requestIP(req)?.address ?? 'unknown'
+}
 
 function connRateLimited(ip: string): boolean {
   const now = Date.now()
-  const arr = (connAttempts.get(ip) ?? []).filter((t) => now - t < CONN_RATE_WINDOW_MS)
+  if (connAttempts.size >= CONN_ATTEMPTS_MAX_KEYS && !connAttempts.has(ip)) {
+    // 防御：条目超上限且是新 key 时清空（伪造 XFF 的无限增长面）
+    connAttempts.clear()
+  }
+  const prev = connAttempts.get(ip)
+  if (!prev) {
+    // 首次请求：记录本次
+    connAttempts.set(ip, [now])
+    return false
+  }
+  const arr = prev.filter((t) => now - t < CONN_RATE_WINDOW_MS)
+  if (arr.length === 0) {
+    // 窗口全部过期：重置为本次请求（同时避免 connAttempts 无限增长）
+    connAttempts.set(ip, [now])
+    return false
+  }
   if (arr.length >= CONN_RATE_MAX) {
     connAttempts.set(ip, arr)
     return true
@@ -151,7 +183,6 @@ function registerTestHandlers(): void {
     const ch = typeof channel === 'string' && channel ? channel : 'test:channel'
     const data = payload === undefined ? ['hello'] : [payload]
     for (const c of allClients) {
-      metrics.eventsSent++
       sendFrame(c, { type: 'event', channel: ch, payload: data })
     }
     return true
@@ -212,11 +243,17 @@ function getState(ws: Client): ConnState {
   return s
 }
 
+/** 发送帧：统一序列化保护 + 出站字节/事件指标（所有帧类型统一口径） */
 function sendFrame(ws: Client, frame: unknown): void {
   try {
-    ws.send(JSON.stringify(frame))
+    const raw = JSON.stringify(frame)
+    metrics.bytesSent += Buffer.byteLength(raw)
+    if (typeof frame === 'object' && frame !== null && (frame as { type?: string }).type === 'event') {
+      metrics.eventsSent++
+    }
+    ws.send(raw)
   } catch {
-    /* 单客户端发送失败忽略 */
+    /* 单客户端发送失败/序列化失败忽略 */
   }
 }
 
@@ -266,23 +303,26 @@ function argsDepthExceeded(value: unknown, depth = 0): boolean {
   return false
 }
 
-/** #2 P0：出站 result 大小限制，超限返回错误帧 */
+/** #2 P0：出站 result 大小限制 + 序列化保护（BigInt/循环引用击穿 settle 链的修复） */
 function sendResult(ws: Client, id: number | string, ok: boolean, result: unknown, error?: string): void {
   const frame = ok ? { type: 'result', id, ok: true, result } : { type: 'result', id, ok: false, error }
-  const raw = JSON.stringify(frame)
-  const size = Buffer.byteLength(raw)
-  metrics.bytesSent += size
+  let size: number
+  try {
+    size = Buffer.byteLength(JSON.stringify(frame))
+  } catch {
+    // 序列化失败（BigInt/循环引用/异常对象）：走错误帧而非击穿 settle 链
+    metrics.invokeErrors++
+    logger.warn('result serialize failed', { id })
+    sendFrame(ws, { type: 'result', id, ok: false, error: 'result serialization failed' })
+    return
+  }
   if (ok && size > MAX_RESULT_BYTES) {
     metrics.invokeErrors++
     logger.warn('result too large', { id, bytes: size, max: MAX_RESULT_BYTES })
     sendFrame(ws, { type: 'result', id, ok: false, error: `result too large: ${size} bytes (max ${MAX_RESULT_BYTES})` })
     return
   }
-  try {
-    ws.send(raw)
-  } catch {
-    /* 单客户端发送失败忽略 */
-  }
+  sendFrame(ws, frame)
 }
 
 /** 处理 invoke 帧（request 通道） */
@@ -320,8 +360,7 @@ async function handleInvoke(ws: Client, msg: InvokeFrame): Promise<void> {
   metrics.invokesTotal++
   runningInvokes++
 
-  try {
-    await new Promise<void>((resolveInvoke) => {
+  await new Promise<void>((resolveInvoke) => {
       const timer = setTimeout(() => {
         st.pending.delete(id)
         metrics.invokeErrors++
@@ -370,11 +409,7 @@ async function handleInvoke(ws: Client, msg: InvokeFrame): Promise<void> {
           }
         })
     })
-  } finally {
-    // 兜底：确保 runningInvokes 不泄漏（正常路径已在 resolve/reject/timeout 递减）
-    // 若 st.closed 时 handleInvoke 仍被触发，避免计数器悬空
   }
-}
 
 /** 清理连接状态（close 时调用，防 pending 泄漏） */
 function cleanupClient(ws: Client): void {
@@ -394,7 +429,6 @@ function cleanupClient(ws: Client): void {
 setEventBroadcast((channel, ...payload) => {
   const frame = { type: 'event', channel, payload }
   if (activeClient) {
-    metrics.eventsSent++
     sendFrame(activeClient, frame)
   }
 })
@@ -423,6 +457,66 @@ const MIME: Record<string, string> = {
 
 const WEB_PRELOAD_PATH = '/web-preload.js'
 
+// 连接状态指示 + 认证失败重试遮罩（server 注入，配合 preload-bridge 暴露的 __PROMA_BRIDGE_STATUS__）：
+// 断线/重连/被顶替对用户可见；auth-failed 时重新显示令牌输入遮罩（token 错误不再无限静默重连）
+const CONN_STATUS_SCRIPT = `
+<script>
+(function () {
+  var bar = null
+  function ensureBar() {
+    if (bar && document.body.contains(bar)) return bar
+    bar = document.createElement('div')
+    bar.id = 'proma-conn-status'
+    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99998;padding:6px 12px;text-align:center;font:12px system-ui,sans-serif;color:#fff;display:none'
+    document.body.appendChild(bar)
+    return bar
+  }
+  function show(msg, bg) {
+    var el = ensureBar()
+    el.textContent = msg
+    el.style.background = bg
+    el.style.display = 'block'
+  }
+  function hide() {
+    if (bar && document.body.contains(bar)) bar.style.display = 'none'
+  }
+  function showAuthGate(msg) {
+    // 幂等守卫：先移除已存在的遮罩（防止状态重复回调时叠加多个同 id 节点）
+    var old = document.getElementById('proma-token-gate')
+    if (old && old.parentNode) old.parentNode.removeChild(old)
+    var div = document.createElement('div')
+    div.id = 'proma-token-gate'
+    div.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(17,24,39,0.96);color:#e5e7eb;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif'
+    div.innerHTML = '<div style="max-width:360px;padding:24px;border:1px solid #374151;border-radius:12px;background:#1f2937"><h2 style="margin:0 0 8px;font-size:18px">Proma Web</h2><p id="proma-auth-msg" style="margin:0 0 16px;color:#ef4444;font-size:13px"></p><form id="proma-token-form"><input id="proma-token-input" type="password" placeholder="token" autocomplete="off" aria-label="访问令牌" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#111827;color:#e5e7eb;margin-bottom:12px;font-size:14px"><button type="submit" style="width:100%;padding:8px;border:0;border-radius:8px;background:#2f6feb;color:#fff;cursor:pointer;font-size:14px">重新连接</button></form></div>'
+    // ⚠️ 先挂载再查询：getElementById 在 appendChild 之前会拿到 null
+    document.body.appendChild(div)
+    // msg 用 textContent 写入（不拼 innerHTML，防未来外部输入注入）
+    document.getElementById('proma-auth-msg').textContent = msg || '认证失败'
+    document.getElementById('proma-token-form').addEventListener('submit', function (ev) {
+      ev.preventDefault()
+      var t = document.getElementById('proma-token-input').value.trim()
+      if (!t) return
+      try { localStorage.setItem('proma_web_token', t) } catch (e) {}
+      location.reload()
+    })
+  }
+  function listen() {
+    var api = window.__PROMA_BRIDGE_STATUS__
+    if (!api) { setTimeout(listen, 500); return }
+    api.onStatusChange(function (status, info) {
+      if (status === 'connected') { hide() }
+      else if (status === 'connecting') { show('连接中…', '#2563eb') }
+      else if (status === 'reconnecting') { show('连接断开，重连中…', '#d97706') }
+      else if (status === 'auth-failed') { show('认证失败：令牌无效', '#dc2626'); showAuthGate('令牌无效或连接被服务器拒绝（请检查 token 与 nginx 反代配置）') }
+      else if (status === 'closed') { show(info && info.code === 4002 ? '多个标签页互顶，请关闭多余标签页后刷新' : '连接已关闭' + (info && info.reason ? '（' + info.reason + '）' : ''), '#dc2626') }
+      else if (status === 'no-token') { /* token-gate 已处理 */ }
+    })
+  }
+  if (document.body) listen()
+  else document.addEventListener('DOMContentLoaded', listen)
+})()
+</script>`
+
 const TOKEN_GATE_SCRIPT = `
 <script>
 // Proma Web token-gate（server 注入）：URL token 转存 localStorage；无 token 显示登录遮罩
@@ -444,7 +538,7 @@ const TOKEN_GATE_SCRIPT = `
         var div = document.createElement('div')
         div.id = 'proma-token-gate'
         div.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(17,24,39,0.96);color:#e5e7eb;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif'
-        div.innerHTML = '<div style="max-width:360px;padding:24px;border:1px solid #374151;border-radius:12px;background:#1f2937"><h2 style="margin:0 0 8px;font-size:18px">Proma Web</h2><p style="margin:0 0 16px;color:#9ca3af;font-size:13px">请输入访问令牌（PROMA_WEB_TOKEN）</p><form id="proma-token-form"><input id="proma-token-input" type="password" placeholder="token" autocomplete="off" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#111827;color:#e5e7eb;margin-bottom:12px;font-size:14px"><button type="submit" style="width:100%;padding:8px;border:0;border-radius:8px;background:#2f6feb;color:#fff;cursor:pointer;font-size:14px">连接</button></form></div>'
+        div.innerHTML = '<div style="max-width:360px;padding:24px;border:1px solid #374151;border-radius:12px;background:#1f2937"><h2 style="margin:0 0 8px;font-size:18px">Proma Web</h2><p style="margin:0 0 16px;color:#9ca3af;font-size:13px">请输入访问令牌（PROMA_WEB_TOKEN）</p><form id="proma-token-form"><input id="proma-token-input" type="password" placeholder="token" autocomplete="off" aria-label="访问令牌" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#111827;color:#e5e7eb;margin-bottom:12px;font-size:14px"><button type="submit" style="width:100%;padding:8px;border:0;border-radius:8px;background:#2f6feb;color:#fff;cursor:pointer;font-size:14px">连接</button></form></div>'
         document.body.appendChild(div)
         document.getElementById('proma-token-form').addEventListener('submit', function (ev) {
           ev.preventDefault()
@@ -461,19 +555,21 @@ const TOKEN_GATE_SCRIPT = `
 })()
 </script>`
 
-/** 向 renderer HTML 注入 web-preload + token-gate（幂等：已注入则原样返回） */
+/** 向 renderer HTML 注入 token-gate + web-preload + 连接状态脚本（幂等：已注入则原样返回）
+ * 顺序：token-gate 最先（URL token 转存并清除后，bridge 才从 localStorage 读取连接），
+ *       web-preload 其次（创建 bridge），连接状态脚本最后（订阅 bridge 状态）。 */
 function injectWebShell(html: string): string {
   if (html.includes(WEB_PRELOAD_PATH)) return html
-  const inject = `<script src="${WEB_PRELOAD_PATH}"></script>\n${TOKEN_GATE_SCRIPT}\n</head>`
+  const inject = `${TOKEN_GATE_SCRIPT}\n<script src="${WEB_PRELOAD_PATH}"></script>\n${CONN_STATUS_SCRIPT}\n</head>`
   if (html.includes('</head>')) return html.replace('</head>', inject)
   return `${html}\n${inject}`
 }
 
 async function serveStatic(pathname: string): Promise<Response> {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '')
-  // 防目录穿越
+  // 防目录穿越（含分隔符边界，防止 /public-xxx 前缀兄弟目录绕过）
   const target = resolve(PUBLIC_DIR, rel)
-  if (!target.startsWith(resolve(PUBLIC_DIR))) {
+  if (!target.startsWith(resolve(PUBLIC_DIR) + sep)) {
     return new Response('forbidden', { status: 403 })
   }
   try {
@@ -548,8 +644,17 @@ try {
     async fetch(req, srv) {
       const url = new URL(req.url)
 
-      // WebSocket 升级（Token 认证 + M7 连接限频 + #28 Origin 校验）
+      // WebSocket 升级（M7 连接限频前置 + Token 认证 + #28 Origin 校验）
       if (url.pathname === '/ws') {
+        if (shuttingDown) {
+          return new Response('server shutting down', { status: 503 })
+        }
+        // 限频放在 token 校验之前：失败尝试同样消耗配额（防 token 暴力破解）
+        const ip = clientIp(req, srv)
+        if (connRateLimited(ip)) {
+          logger.warn('connection rate limited', { ip })
+          return new Response('too many connections, slow down', { status: 429 })
+        }
         const token = url.searchParams.get('token')
         if (token !== WS_TOKEN) {
           return new Response('unauthorized: bad or missing token', { status: 401 })
@@ -558,17 +663,15 @@ try {
           logger.warn('origin not allowed', { origin: req.headers.get('origin') })
           return new Response('forbidden: origin not allowed', { status: 403 })
         }
-        const ip = srv.requestIP(req)?.address ?? 'unknown'
-        if (connRateLimited(ip)) {
-          logger.warn('connection rate limited', { ip })
-          return new Response('too many connections, slow down', { status: 429 })
-        }
         if (srv.upgrade(req)) return undefined
         return new Response('upgrade failed', { status: 400 })
       }
 
-      // 健康检查
+      // 健康检查（停机窗口内返回 503：让重连客户端走网络故障分支，而非误判认证失败）
       if (url.pathname === '/health') {
+        if (shuttingDown) {
+          return Response.json({ status: 'shutting_down' }, { status: 503 })
+        }
         return Response.json({
           status: 'ok',
           name: PROTOCOL_NAME,
@@ -614,6 +717,8 @@ try {
         sendFrame(ws, {
           type: 'ready',
           protocol: PROTOCOL_VERSION,
+          // 下发消息大小上限：renderer 预检用（避免客户端硬编码与服务端配置脱钩）
+          maxMsgBytes: MAX_MSG_BYTES,
           channels: listRegisteredChannels(),
           server: {
             name: PROTOCOL_NAME,
@@ -652,6 +757,11 @@ try {
 
         switch (frame.type) {
           case 'invoke':
+            if (shuttingDown) {
+              // 优雅停机窗口内拒绝新 invoke（避免 force-exit 中断写文件/bash）
+              sendFrame(ws, { type: 'result', id: (frame as { id?: number | string }).id, ok: false, error: 'server shutting down' })
+              break
+            }
             void handleInvoke(ws, frame as unknown as InvokeFrame)
             break
           case 'ping':

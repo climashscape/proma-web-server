@@ -2,13 +2,12 @@
 #
 # 适用：Linux 主机 / NAS（飞牛 fpk 打包见阶段 5，此处为通用 systemd 方案）
 # 使用：
-#   1. 拷贝 server-test 到部署目录（如 /opt/proma-web）
-#   2. 替换下面环境变量占位符
+#   1. 拷贝 server 目录到部署目录（如 /opt/proma-web/server）
+#   2. 替换下面环境变量占位符（或直接走 deploy/install.sh 自动生成）
 #   3. sudo cp deploy/proma-web.service /etc/systemd/system/
 #   4. sudo systemctl daemon-reload && sudo systemctl enable --now proma-web
 #
-# 注意：NAS 部署建议改用 fpk（run-as root + runuser 切换 <app-user>，见
-#       docs/飞牛OS-应用打包SOP.md）；本 unit 是独立主机/调试环境的衔接模板。
+# 注意：NAS 部署建议改用 fpk（run-as root + runuser 切换 <app-user>）；本 unit 是独立主机/调试环境的衔接模板。
 
 [Unit]
 Description=Proma Web Server (WS IPC bridge for Proma Web 化)
@@ -20,12 +19,16 @@ Type=simple
 # 数据目录归属用户（如 NAS 上为 <app-user>；本机开发可为当前用户）
 User=__RUN_USER__
 Group=__RUN_GROUP__
-WorkingDirectory=/opt/proma-web
+# ⚠️ 必须指向仓库的 server 目录（server.ts 依赖 cwd 定位 public/ 与 .env）；
+# install.sh 会自动替换；手工部署请改为 <repo>/server
+WorkingDirectory=/opt/proma-web/server
 
 # ---- 必填 ----
-Environment=PROMA_WEB_TOKEN=__CHANGE_ME_RANDOM_TOKEN__
-# 局域网访问必须 0.0.0.0；仅本机可保持 127.0.0.1
-Environment=PROMA_WEB_HOST=0.0.0.0
+# token 从 EnvironmentFile 读取（.env 权限 600，避免 unit 文件 644 泄露明文 token）；
+# 由 install.sh 生成；手工部署请指向含 PROMA_WEB_TOKEN 的 600 权限文件
+EnvironmentFile=__ENV_FILE__
+# 监听地址在 .env 中配置（PROMA_WEB_HOST，install.sh 默认写 0.0.0.0 局域网可访问；仅本机改 127.0.0.1）
+# ⚠️ 0.0.0.0 暴露给局域网时务必配 HTTPS 反代
 Environment=PROMA_WEB_PORT=6810
 Environment=PROMA_SRC=__PROMA_SRC__
 # 数据目录：NAS 用 /vol1/@appdata/proma；独立主机可用 ~/.proma-web

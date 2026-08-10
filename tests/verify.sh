@@ -53,9 +53,8 @@ if [ -f "$PID_FILE" ]; then
   kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true
   rm -f "$PID_FILE"
 fi
-# 兜底：匹配 bun run server.ts（cmdline 无完整路径）与绝对路径两种形态
+# 兜底：仅匹配 bun 运行形态（cmdline 固定为 'bun run server.ts'）；不匹配裸 'server.ts$'（防误杀其他项目同名文件）
 pkill -f 'bun run server.ts$' 2>/dev/null || true
-pkill -f 'server.ts$' 2>/dev/null || true
 sleep 1
 
 # 检查 Proma 源码级 electron stub patch：未 patch 时自动 apply
@@ -72,7 +71,7 @@ echo "=== [2/8] 构建 web-preload bundle ==="
 if [ -f "$SERVER_DIR/public/web-preload.js" ]; then
   echo "  ✅ web-preload.js 已存在（跳过构建；如需重建删掉该文件后重跑）"
 else
-  if (cd "$SERVER_DIR" && PROMA_SRC="$PROMA_SRC" bun run build:web-preload); then
+  if (cd "$SERVER_DIR" && PROMA_WEB_BUILD_TS="$(date +%Y%m%d)" PROMA_SRC="$PROMA_SRC" bun run build:web-preload); then
     echo "  ✅ web-preload bundle 构建完成"
   else
     echo "  ❌ web-preload bundle 构建失败（后续验证依赖该产物，终止）"
@@ -158,12 +157,20 @@ if [ "$EXTRA" = "1" ]; then
     echo "  ❌ client-test 扩展失败"; fail=$((fail+1))
   fi
   # bridge 运行态（浏览器桥，连真实 server；含 #10 真实事件断言，依赖 TEST_MODE）
-  if (cd "$SERVER_DIR" && PROMA_WEB_TOKEN="$PROMA_WEB_TOKEN" bun run web/bridge-test.ts); then
+  if (cd "$SERVER_DIR" && PROMA_WEB_TOKEN="$PROMA_WEB_TOKEN" PROMA_WEB_WS="ws://127.0.0.1:${PORT}/ws" bun run web/bridge-test.ts); then
     echo "  ✅ bridge 运行态通过"; pass=$((pass+1))
   else
     echo "  ❌ bridge 运行态失败"; fail=$((fail+1))
   fi
+  # handler-coverage（70+ 通道只读覆盖，check-fail 安全模式；产出报告到 /tmp/proma-web-coverage）
+  # ⚠️ 必须放在 extended-test 之前：extended #23 连接限频断言会耗尽同 IP 10s 配额，之后任何连接测试都会 429
+  if (cd "$SERVER_DIR" && PROMA_WEB_TOKEN="$PROMA_WEB_TOKEN" PROMA_WEB_WS="ws://127.0.0.1:${PORT}/ws" bun run handler-coverage.ts); then
+    echo "  ✅ handler-coverage（70+ 通道）通过"; pass=$((pass+1))
+  else
+    echo "  ❌ handler-coverage 失败"; fail=$((fail+1))
+  fi
   # P1 扩展验证（非法帧/深 args/大 result/重复 id/脱敏/连接限频）
+  # ⚠️ #23 连接限频断言会耗尽同 IP 的 10s 连接配额，必须放在最后（后续连接测试会 429）
   if (cd "$SERVER_DIR" && PROMA_WEB_TOKEN="$PROMA_WEB_TOKEN" PROMA_WEB_WS="ws://127.0.0.1:${PORT}/ws" bun run extended-test.ts); then
     echo "  ✅ extended-test（P1 验证）通过"; pass=$((pass+1))
   else

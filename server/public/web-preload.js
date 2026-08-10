@@ -1,3 +1,9 @@
+// ============================================================================
+// ⚠️ 本文件由 build-preload-bundle.ts 自动生成，请勿手工编辑（上游更新时重新生成）
+// 生成时间: 20260810（默认固定，设置 PROMA_WEB_BUILD_TS 写入实际时间戳）
+// 来源: web/preload.ts（由 build-web-preload.ts 从 Proma preload/index.ts 转换）
+// 说明: 浏览器端 electronAPI（WS IPC 桥），含 Web 模式降级（剪贴板/文件选择/连接状态）
+// ============================================================================
 (() => {
   var __defProp = Object.defineProperty;
   var __getOwnPropNames = Object.getOwnPropertyNames;
@@ -28,6 +34,20 @@
   var exports_preload = {};
 
   // web/preload-bridge.ts
+  function stripTokenFromSearch(search) {
+    const cleaned = search.replace(/[?&]token=[^&]*/g, "");
+    if (!cleaned)
+      return "";
+    return cleaned.startsWith("&") ? "?" + cleaned.slice(1) : cleaned;
+  }
+  function clearTokenFromUrlGlobal() {
+    try {
+      const qs = stripTokenFromSearch(globalThis.location?.search ?? "");
+      if (globalThis.location?.search !== qs) {
+        globalThis.history?.replaceState(null, "", globalThis.location.pathname + qs + (globalThis.location?.hash ?? ""));
+      }
+    } catch {}
+  }
   function resolveToken() {
     const cfg = globalThis.__PROMA_WEB_CONFIG__;
     if (cfg?.token)
@@ -37,6 +57,7 @@
       try {
         globalThis.localStorage?.setItem("proma_web_token", fromUrl);
       } catch {}
+      clearTokenFromUrlGlobal();
       return fromUrl;
     }
     try {
@@ -72,7 +93,14 @@
     readyPromise = Promise.resolve();
     statusListeners = new Set;
     currentStatus = "closed";
+    get status() {
+      return this.currentStatus;
+    }
     token;
+    serverMaxMsgBytes = 4 * 1024 * 1024;
+    supersedeCount = 0;
+    supersedeResetTimer = null;
+    handshakeFailStreak = 0;
     get ready() {
       return this.readyPromise;
     }
@@ -137,7 +165,15 @@
       this.ws = ws;
       ws.onopen = () => {
         this.reconnectDelay = 1000;
+        this.handshakeFailStreak = 0;
+        if (this.supersedeResetTimer)
+          clearTimeout(this.supersedeResetTimer);
+        this.supersedeResetTimer = setTimeout(() => {
+          this.supersedeCount = 0;
+          this.supersedeResetTimer = null;
+        }, 1e4);
         this.setStatus("connected");
+        this.clearTokenFromUrl();
       };
       ws.onmessage = (ev) => {
         let msg;
@@ -148,6 +184,9 @@
         }
         switch (msg?.type) {
           case "ready":
+            if (typeof msg.maxMsgBytes === "number" && msg.maxMsgBytes > 0) {
+              this.serverMaxMsgBytes = msg.maxMsgBytes;
+            }
             if (this.readyResolve) {
               this.readyResolve();
               this.readyResolve = null;
@@ -172,6 +211,7 @@
           return;
         if (ev.code === 1001 || ev.code === 4003) {
           this.closedByUser = true;
+          this.clearSupersedeTimer();
           this.rejectAllPending(new Error(`ws closed by server (code ${ev.code})`));
           this.rejectReady(new Error(`ws closed by server (code ${ev.code})`));
           this.setStatus("closed", { code: ev.code, reason: "closed by server" });
@@ -180,12 +220,24 @@
         if (ev.code === 4002) {
           this.rejectAllPending(new Error("ws superseded by another connection, reconnecting…"));
           this.rejectReady(new Error("ws superseded by another connection, reconnecting…"));
+          this.clearSupersedeTimer();
+          this.supersedeCount++;
+          if (this.supersedeCount >= 2) {
+            this.closedByUser = true;
+            this.setStatus("closed", { code: 4002, reason: "superseded repeatedly (multiple tabs), please refresh manually" });
+            return;
+          }
           this.setStatus("reconnecting", { code: 4002, reason: "superseded" });
           this.scheduleReconnect(5000);
           return;
         }
         this.rejectAllPending(new Error("ws disconnected, reconnecting…"));
         this.rejectReady(new Error("ws disconnected, reconnecting…"));
+        this.handshakeFailStreak++;
+        if (this.handshakeFailStreak >= 2) {
+          this.probeAuthFailure();
+          return;
+        }
         this.setStatus("reconnecting", { code: ev.code, reason: "disconnected" });
         this.scheduleReconnect();
       };
@@ -194,6 +246,31 @@
           ws.close();
         } catch {}
       };
+    }
+    clearSupersedeTimer() {
+      if (this.supersedeResetTimer) {
+        clearTimeout(this.supersedeResetTimer);
+        this.supersedeResetTimer = null;
+      }
+    }
+    clearTokenFromUrl() {
+      clearTokenFromUrlGlobal();
+    }
+    async probeAuthFailure() {
+      this.setStatus("reconnecting", { reason: "probing server" });
+      try {
+        const base = `${globalThis.location?.protocol ?? "http:"}//${globalThis.location?.host ?? "127.0.0.1:6810"}`;
+        const res = await fetch(`${base}/ws?token=${encodeURIComponent(this.token)}`, { cache: "no-store", signal: AbortSignal.timeout(5000) });
+        if (res.status === 401) {
+          this.closedByUser = true;
+          this.rejectAllPending(new Error("authentication failed: invalid token"));
+          this.rejectReady(new Error("authentication failed: invalid token"));
+          this.setStatus("auth-failed", { reason: "invalid token" });
+          return;
+        }
+      } catch {}
+      this.setStatus("reconnecting", { reason: "disconnected" });
+      this.scheduleReconnect();
     }
     rejectAllPending(err) {
       for (const [, p] of this.pending)
@@ -237,6 +314,7 @@
     }
     dispose() {
       this.closedByUser = true;
+      this.clearSupersedeTimer();
       this.rejectAllPending(new Error("bridge disposed"));
       this.rejectReady(new Error("bridge disposed"));
       this.setStatus("closed", { reason: "disposed" });
@@ -250,14 +328,29 @@
         end--;
       return args.slice(0, end);
     }
+    get maxMsgBytes() {
+      return this.serverMaxMsgBytes;
+    }
     invoke(channel, ...args) {
       const id = this.nextId++;
       const trimmed = this.trimUndefinedArgs(args);
+      const frameLimit = this.serverMaxMsgBytes;
+      try {
+        const frameSize = new Blob([JSON.stringify({ type: "invoke", id, channel, args: trimmed })]).size;
+        if (frameSize > frameLimit) {
+          return Promise.reject(new Error(`message too large: ${frameSize} bytes (max ${frameLimit})`));
+        }
+      } catch {}
       return new Promise((resolve, reject) => {
         const sendIfOpen = () => {
           if (this.ws?.readyState === WebSocket.OPEN) {
             this.pending.set(id, { resolve, reject });
-            this.sendRaw({ type: "invoke", id, channel, args: trimmed });
+            try {
+              this.sendRaw({ type: "invoke", id, channel, args: trimmed });
+            } catch (e) {
+              this.pending.delete(id);
+              reject(e instanceof Error ? e : new Error(String(e)));
+            }
             return true;
           }
           return false;
@@ -290,11 +383,24 @@
       }
     }
     sendSync(channel, ...args) {
-      this.invoke(channel, ...args).then((v) => this.syncCache.set(channel, v)).catch(() => {});
-      if (!this.syncCache.has(channel)) {
+      let key;
+      try {
+        key = channel + "\x00" + JSON.stringify(args);
+      } catch {
+        key = channel;
+      }
+      if (this.syncCache.size >= 100) {
+        const oldest = this.syncCache.keys().next().value;
+        if (oldest !== undefined)
+          this.syncCache.delete(oldest);
+      }
+      this.invoke(channel, ...args).then((v) => this.syncCache.set(key, v)).catch((e) => {
+        console.warn(`[bridge] sendSync ${channel} failed:`, e instanceof Error ? e.message : e);
+      });
+      if (!this.syncCache.has(key)) {
         return true;
       }
-      return this.syncCache.get(channel);
+      return this.syncCache.get(key);
     }
     settle(id, msg) {
       const p = this.pending.get(id);
@@ -381,6 +487,11 @@
     }
   };
   var ipcRenderer = new WSBridge(resolveWsUrl());
+  globalThis.__PROMA_BRIDGE_STATUS__ = {
+    onStatusChange: (fn) => ipcRenderer.onStatusChange(fn),
+    offStatusChange: (fn) => ipcRenderer.offStatusChange(fn),
+    getStatus: () => ipcRenderer.status
+  };
   if (typeof globalThis.addEventListener === "function") {
     globalThis.addEventListener("beforeunload", () => {
       try {
@@ -389,12 +500,13 @@
     });
   }
 
-  // ../Proma/packages/shared/src/types/runtime.ts
+  // ../../../../Proma/packages/shared/src/types/runtime.ts
   var IPC_CHANNELS = {
     GET_RUNTIME_STATUS: "runtime:get-status",
     REINIT_RUNTIME: "runtime:reinit",
     GET_GIT_REPO_STATUS: "git:get-repo-status",
     GET_UNSTAGED_CHANGES: "git:get-unstaged-changes",
+    INVALIDATE_GIT_DIFF_CACHE: "git:invalidate-diff-cache",
     GET_FILE_DIFF: "git:get-file-diff",
     GET_UNTRACKED_CONTENT: "git:get-untracked-content",
     REVERT_FILE: "git:revert-file",
@@ -423,7 +535,7 @@
     MIN_WIDTH: 480,
     MAX_WIDTH: 1600
   };
-  // ../Proma/packages/shared/src/types/channel.ts
+  // ../../../../Proma/packages/shared/src/types/channel.ts
   var CHANNEL_IPC_CHANNELS = {
     LIST: "channel:list",
     CREATE: "channel:create",
@@ -441,13 +553,13 @@
     XAI_OAUTH_CANCEL: "channel:xai-oauth-cancel",
     XAI_OAUTH_DEVICE_CODE: "channel:xai-oauth-device-code"
   };
-  // ../Proma/packages/shared/src/types/proxy.ts
+  // ../../../../Proma/packages/shared/src/types/proxy.ts
   var PROXY_IPC_CHANNELS = {
     GET_SETTINGS: "proxy:get-settings",
     UPDATE_SETTINGS: "proxy:update-settings",
     DETECT_SYSTEM: "proxy:detect-system"
   };
-  // ../Proma/packages/shared/src/types/chat.ts
+  // ../../../../Proma/packages/shared/src/types/chat.ts
   var MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024;
   var CHAT_IPC_CHANNELS = {
     LIST_CONVERSATIONS: "chat:list-conversations",
@@ -481,7 +593,7 @@
     STREAM_ERROR: "chat:stream:error",
     STREAM_TOOL_ACTIVITY: "chat:stream:tool-activity"
   };
-  // ../Proma/packages/shared/src/types/agent.ts
+  // ../../../../Proma/packages/shared/src/types/agent.ts
   var AGENT_IPC_CHANNELS = {
     LIST_SESSIONS: "agent:list-sessions",
     CREATE_SESSION: "agent:create-session",
@@ -602,7 +714,7 @@
     QUEUED_MESSAGE_STATUS: "agent:queued-message-status",
     GET_PENDING_REQUESTS: "agent:get-pending-requests"
   };
-  // ../Proma/packages/shared/src/types/reasoning-profile.ts
+  // ../../../../Proma/packages/shared/src/types/reasoning-profile.ts
   var OPENAI_STANDARD_LEVELS = ["off", "low", "medium", "high", "xhigh"];
   var OPENAI_MAX_LEVELS = [...OPENAI_STANDARD_LEVELS, "max"];
   var OPENAI_STANDARD_EFFORT_MAP = {
@@ -614,11 +726,11 @@
     ...OPENAI_STANDARD_EFFORT_MAP,
     max: "max"
   };
-  // ../Proma/packages/shared/src/types/environment.ts
+  // ../../../../Proma/packages/shared/src/types/environment.ts
   var ENVIRONMENT_IPC_CHANNELS = {
     CHECK: "environment:check"
   };
-  // ../Proma/packages/shared/src/types/installer.ts
+  // ../../../../Proma/packages/shared/src/types/installer.ts
   var INSTALLER_IPC_CHANNELS = {
     MANIFEST: "installer:manifest",
     DOWNLOAD: "installer:download",
@@ -626,13 +738,13 @@
     LAUNCH: "installer:launch",
     PROGRESS: "installer:progress"
   };
-  // ../Proma/packages/shared/src/types/github.ts
+  // ../../../../Proma/packages/shared/src/types/github.ts
   var GITHUB_RELEASE_IPC_CHANNELS = {
     GET_LATEST_RELEASE: "github-release:get-latest",
     LIST_RELEASES: "github-release:list",
     GET_RELEASE_BY_TAG: "github-release:get-by-tag"
   };
-  // ../Proma/packages/shared/src/types/system-prompt.ts
+  // ../../../../Proma/packages/shared/src/types/system-prompt.ts
   var SYSTEM_PROMPT_IPC_CHANNELS = {
     GET_CONFIG: "system-prompt:get-config",
     CREATE: "system-prompt:create",
@@ -641,7 +753,7 @@
     UPDATE_APPEND_SETTING: "system-prompt:update-append-setting",
     SET_DEFAULT: "system-prompt:set-default"
   };
-  // ../Proma/packages/shared/src/types/chat-tool.ts
+  // ../../../../Proma/packages/shared/src/types/chat-tool.ts
   var CHAT_TOOL_IPC_CHANNELS = {
     GET_ALL_TOOLS: "chat-tool:get-all-tools",
     GET_TOOL_CREDENTIALS: "chat-tool:get-credentials",
@@ -652,7 +764,7 @@
     DELETE_CUSTOM_TOOL: "chat-tool:delete-custom",
     CUSTOM_TOOL_CHANGED: "chat-tool:custom-tool-changed"
   };
-  // ../Proma/packages/shared/src/types/feishu.ts
+  // ../../../../Proma/packages/shared/src/types/feishu.ts
   var FEISHU_IPC_CHANNELS = {
     GET_CONFIG: "feishu:get-config",
     SAVE_CONFIG: "feishu:save-config",
@@ -679,7 +791,7 @@
     REGISTER_APP_STATUS: "feishu:register-app-status",
     REGISTER_APP_CANCEL: "feishu:register-app-cancel"
   };
-  // ../Proma/packages/shared/src/types/dingtalk.ts
+  // ../../../../Proma/packages/shared/src/types/dingtalk.ts
   var DINGTALK_IPC_CHANNELS = {
     GET_CONFIG: "dingtalk:get-config",
     SAVE_CONFIG: "dingtalk:save-config",
@@ -698,7 +810,7 @@
     GET_MULTI_STATUS: "dingtalk:get-multi-status",
     MULTI_STATUS_CHANGED: "dingtalk:multi-status-changed"
   };
-  // ../Proma/packages/shared/src/types/wechat.ts
+  // ../../../../Proma/packages/shared/src/types/wechat.ts
   var WECHAT_IPC_CHANNELS = {
     GET_CONFIG: "wechat:get-config",
     SAVE_CONFIG: "wechat:save-config",
@@ -709,7 +821,7 @@
     GET_STATUS: "wechat:get-status",
     STATUS_CHANGED: "wechat:status-changed"
   };
-  // ../Proma/packages/shared/src/types/automation.ts
+  // ../../../../Proma/packages/shared/src/types/automation.ts
   var AUTOMATION_IPC_CHANNELS = {
     LIST: "automation:list",
     CREATE: "automation:create",
@@ -719,7 +831,7 @@
     RUN_NOW: "automation:run-now",
     CHANGED: "automation:changed"
   };
-  // ../Proma/packages/shared/src/types/planning.ts
+  // ../../../../Proma/packages/shared/src/types/planning.ts
   var PLANNING_IPC_CHANNELS = {
     LIST_TODOS: "planning:list-todos",
     CREATE_TODO: "planning:create-todo",
@@ -756,11 +868,11 @@
     LIST_SYNC_PROFILES: "planning:list-sync-profiles",
     SAVE_SYNC_PROFILE: "planning:save-sync-profile"
   };
-  // ../Proma/packages/shared/src/types/agent-island.ts
+  // ../../../../Proma/packages/shared/src/types/agent-island.ts
   var AGENT_ISLAND_IPC_CHANNELS = {
     MARK_SESSION_VIEWED: "agent-island:mark-session-viewed"
   };
-  // ../Proma/packages/shared/src/utils/context-window.ts
+  // ../../../../Proma/packages/shared/src/utils/context-window.ts
   var ONE_MILLION_CONTEXT_RULES = {
     claude: [
       "claude-sonnet-4-6",
@@ -796,13 +908,13 @@
       "mimo-v2-pro"
     ]
   };
-  // ../Proma/packages/shared/src/utils/mcp-transport.ts
+  // ../../../../Proma/packages/shared/src/utils/mcp-transport.ts
   var STREAMABLE_HTTP_ALIASES = new Set([
     "streamableHttp",
     "streamable-http",
     "streamable_http"
   ]);
-  // ../Proma/apps/electron/src/types/settings.ts
+  // ../../../../Proma/apps/electron/src/types/settings.ts
   var SETTINGS_IPC_CHANNELS = {
     GET: "settings:get",
     UPDATE: "settings:update",
@@ -868,7 +980,7 @@
     CLEANUP: "storage:cleanup",
     CLEANUP_TEMP: "storage:cleanup-temp"
   };
-  // ../Proma/apps/electron/src/types/user-profile.ts
+  // ../../../../Proma/apps/electron/src/types/user-profile.ts
   var USER_PROFILE_IPC_CHANNELS = {
     GET: "user-profile:get",
     UPDATE: "user-profile:update"
@@ -886,6 +998,9 @@
     },
     getUnstagedChanges: (dirPath, sessionPath, workspaceFilesPath, extraPaths, sessionId) => {
       return ipcRenderer.invoke(IPC_CHANNELS.GET_UNSTAGED_CHANGES, dirPath, sessionPath, workspaceFilesPath, extraPaths, sessionId);
+    },
+    invalidateGitDiffCache: (changedPath) => {
+      return ipcRenderer.invoke(IPC_CHANNELS.INVALIDATE_GIT_DIFF_CACHE, changedPath);
     },
     getFileDiff: (input) => {
       return ipcRenderer.invoke(IPC_CHANNELS.GET_FILE_DIFF, input);
@@ -915,7 +1030,27 @@
       return ipcRenderer.invoke(IPC_CHANNELS.OPEN_EXTERNAL, url);
     },
     writeClipboardText: async (text) => {
-      await navigator.clipboard.writeText(text);
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(text);
+          return;
+        }
+      } catch {}
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try {
+        ok = document.execCommand("copy");
+      } catch {
+        ok = false;
+      }
+      ta.remove();
+      if (!ok)
+        throw new Error("复制失败：浏览器上下文不支持剪贴板（请使用 HTTPS 访问或重试）");
     },
     windowMinimize: () => {
       return ipcRenderer.invoke(IPC_CHANNELS.WINDOW_MINIMIZE);
@@ -1069,12 +1204,20 @@
           const files = [];
           const largeFiles = [];
           const skippedFiles = [];
+          const frameLimit = ipcRenderer.maxMsgBytes || 4 * 1024 * 1024;
+          const maxBase64 = frameLimit - 8192;
           const MAX_SIZE = 100 * 1024 * 1024;
+          let accBase64 = 0;
           for (const f of picked) {
             const mediaType = f.type || "application/octet-stream";
             try {
               if (f.size > MAX_SIZE) {
                 largeFiles.push({ filename: f.name, mediaType, size: f.size, path: "" });
+                continue;
+              }
+              const estBase64 = Math.ceil(f.size / 3) * 4;
+              if (estBase64 > maxBase64 || accBase64 + estBase64 > maxBase64) {
+                skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: "", reason: "超过 Web 版消息上限（约 " + Math.max(1, Math.floor(frameLimit * 0.75 / 1024 / 1024)) + "MB）" });
                 continue;
               }
               const data = await new Promise((res, rej) => {
@@ -1083,6 +1226,11 @@
                 reader.onerror = () => rej(reader.error || new Error("read failed"));
                 reader.readAsDataURL(f);
               });
+              if (data.length > maxBase64 || accBase64 + data.length > maxBase64) {
+                skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: "", reason: "超过 Web 版消息上限（约 " + Math.max(1, Math.floor(frameLimit * 0.75 / 1024 / 1024)) + "MB）" });
+                continue;
+              }
+              accBase64 += data.length;
               files.push({ filename: f.name, mediaType, data, size: f.size });
             } catch (e) {
               skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: "", reason: "unreadable", message: String(e) });
@@ -1564,12 +1712,20 @@
           const files = [];
           const largeFiles = [];
           const skippedFiles = [];
+          const frameLimit = ipcRenderer.maxMsgBytes || 4 * 1024 * 1024;
+          const maxBase64 = frameLimit - 8192;
           const MAX_SIZE = 100 * 1024 * 1024;
+          let accBase64 = 0;
           for (const f of picked) {
             const mediaType = f.type || "application/octet-stream";
             try {
               if (f.size > MAX_SIZE) {
                 largeFiles.push({ filename: f.name, mediaType, size: f.size, path: "" });
+                continue;
+              }
+              const estBase64 = Math.ceil(f.size / 3) * 4;
+              if (estBase64 > maxBase64 || accBase64 + estBase64 > maxBase64) {
+                skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: "", reason: "超过 Web 版消息上限（约 " + Math.max(1, Math.floor(frameLimit * 0.75 / 1024 / 1024)) + "MB）" });
                 continue;
               }
               const data = await new Promise((res, rej) => {
@@ -1578,6 +1734,11 @@
                 reader.onerror = () => rej(reader.error || new Error("read failed"));
                 reader.readAsDataURL(f);
               });
+              if (data.length > maxBase64 || accBase64 + data.length > maxBase64) {
+                skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: "", reason: "超过 Web 版消息上限（约 " + Math.max(1, Math.floor(frameLimit * 0.75 / 1024 / 1024)) + "MB）" });
+                continue;
+              }
+              accBase64 += data.length;
               files.push({ filename: f.name, mediaType, data, size: f.size });
             } catch (e) {
               skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: "", reason: "unreadable", message: String(e) });

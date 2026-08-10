@@ -1,6 +1,6 @@
 # Proma Web PoC — bunfig
-# 说明：bunfig [alias] 在此环境（Bun 1.3.14 / WSL）实测不生效，
-# 实际 electron stub 通过替换 node_modules/electron/index.js 实现（见 handoff §五/§六）。
-# 保留此文件仅为未来版本升级后重试 alias 机制预留。
+# 说明：electron stub 通过 patches/patch-proma.sh 源码级 patch 实现
+# （把 from 'electron' import 替换为 @proma/electron-stub 并建立 node_modules 链接）。
+# bunfig [alias] 机制在此环境（Bun 1.3.14）实测不生效，保留此文件仅为未来版本升级后重试 alias 机制预留。
 [install]
 save = false

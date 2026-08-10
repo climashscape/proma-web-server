@@ -53,6 +53,8 @@ export type ClientFrame = InvokeFrame | PingFrame | PongFrame
 export interface ReadyFrame {
   type: 'ready'
   protocol: number
+  /** 服务端单条 WS 消息大小上限（字节）；可选字段，旧服务端不发送时客户端用默认 4MB */
+  maxMsgBytes?: number
   /** 当前可 invoke 的全部 handler 通道 */
   channels: string[]
   server: {
