@@ -4,7 +4,7 @@
  * 在浏览器里替代 Electron 的 ipcRenderer / contextBridge / webUtils，
  * API 表面与 ipcRenderer 对齐，使生成的 web-preload 可以直接复用。
  *
- * 协议见 server/protocol.ts（request/event 两类通道）：
+ * 协议见 server-test/protocol.ts（request/event 两类通道）：
  *  - invoke:  {type:'invoke', id, channel, args} → {type:'result', id, ok, result|error}
  *  - 事件推送: {type:'event', channel, payload} → 分发到 on/once 注册的 listener
  *  - 心跳:    {type:'ping'} → 客户端回 {type:'pong'}
@@ -14,12 +14,12 @@
  *  - 自动重连（指数退避 1s→30s），断线时 pending invoke 全部 reject，listeners 保留
  *  - sendSync 兼容：浏览器无法真同步，返回缓存值（首次乐观 true），后台异步 invoke
  *  - 事件监听与 ipcRenderer 相同签名：(event, ...args)，event 为伪 IpcRendererEvent
- *  - 状态通知（#16）：onStatusChange 监听连接生命周期（no-token/connecting/connected/reconnecting/auth-failed/closed）
+ *  - 状态通知（#16）：onStatusChange 监听连接生命周期（no-token/connecting/connected/reconnecting/closed）
  *  - M2 懒连接：无 token 时不发起 WS 连接（由 token-gate 注入页负责引导输入 token 后刷新）
  */
 
-/** 连接生命周期状态 */
-export type BridgeStatus = 'no-token' | 'connecting' | 'connected' | 'reconnecting' | 'auth-failed' | 'closed'
+/** 连接生命周期状态（#16） */
+export type BridgeStatus = 'no-token' | 'connecting' | 'connected' | 'reconnecting' | 'closed'
 
 export type StatusListener = (status: BridgeStatus, info?: { code?: number; reason?: string }) => void
 
@@ -32,25 +32,6 @@ export interface BridgeEvent {
 
 type Listener = (event: BridgeEvent, ...args: unknown[]) => void
 
-/** 从 search 中移除 token 参数并保留其余参数（正则边界：token 为首参时残留的 & 需补 ? 前缀） */
-function stripTokenFromSearch(search: string): string {
-  const cleaned = search.replace(/[?&]token=[^&]*/g, '')
-  if (!cleaned) return ''
-  return cleaned.startsWith('&') ? '?' + cleaned.slice(1) : cleaned
-}
-
-/** 清除当前 URL 中的 token 参数（保留其余参数与 hash；resolveToken 与 bridge 共用） */
-function clearTokenFromUrlGlobal(): void {
-  try {
-    const qs = stripTokenFromSearch(globalThis.location?.search ?? '')
-    if (globalThis.location?.search !== qs) {
-      globalThis.history?.replaceState(null, '', globalThis.location.pathname + qs + (globalThis.location?.hash ?? ''))
-    }
-  } catch {
-    /* ignore */
-  }
-}
-
 function resolveToken(): string {
   const cfg = (globalThis as any).__PROMA_WEB_CONFIG__ as { token?: string; wsUrl?: string } | undefined
   if (cfg?.token) return cfg.token
@@ -61,8 +42,6 @@ function resolveToken(): string {
     } catch {
       /* private mode */
     }
-    // 立即清除 URL 中的 token，避免留在浏览器历史/Referer/代理日志（token-gate 兜底）
-    clearTokenFromUrlGlobal()
     return fromUrl
   }
   try {
@@ -95,25 +74,11 @@ class WSBridge {
   private readyResolve: (() => void) | null = null
   private readyReject: ((e: Error) => void) | null = null
   private readyPromise: Promise<void> = Promise.resolve()
-  // 状态通知
+  // #16：状态通知
   private statusListeners = new Set<StatusListener>()
   private currentStatus: BridgeStatus = 'closed'
-
-  /** 当前状态（供注入脚本读取） */
-  get status(): BridgeStatus {
-    return this.currentStatus
-  }
   // M2：显式保存 token，无 token 时不连接
   private token: string
-  // 服务端下发的消息大小上限（ready 帧携带；未收到时用默认 4MB 预检）
-  private serverMaxMsgBytes = 4 * 1024 * 1024
-  // 乒乓熔断：连续被顶替次数（4002）；连续 2 次被顶后停止自动重连，避免多 tab 无限互顶。
-  // 计数只在连接稳定 10s 后清零（onopen 不清零——被顶只能发生在连接建立之后，
-  // 若 onopen 清零则 4002→重连→4002 永远到不了 2，熔断永不触发）
-  private supersedeCount = 0
-  private supersedeResetTimer: ReturnType<typeof setTimeout> | null = null
-  // 认证失败探测：连续握手失败达到阈值 → 探测 /health 区分认证失败与网络故障（连接成功后同样适用）
-  private handshakeFailStreak = 0
 
   /** 就绪 promise：每次连接重新创建（B1 修复：断线重连后 await ready 反映新连接状态） */
   get ready(): Promise<void> {
@@ -130,7 +95,7 @@ class WSBridge {
     this.connect()
   }
 
-  // ===================== 状态通知 =====================
+  // ===================== 状态通知（#16） =====================
 
   /** 订阅连接状态变化，立即回调当前状态 */
   onStatusChange(fn: StatusListener): this {
@@ -194,16 +159,7 @@ class WSBridge {
 
     ws.onopen = () => {
       this.reconnectDelay = 1000
-      this.handshakeFailStreak = 0
-      // 连接稳定 10s 未被顶替才清零熔断计数（被顶后重连成功不能立即清零，否则多 tab 互顶永远熔断不了）
-      if (this.supersedeResetTimer) clearTimeout(this.supersedeResetTimer)
-      this.supersedeResetTimer = setTimeout(() => {
-        this.supersedeCount = 0
-        this.supersedeResetTimer = null
-      }, 10_000)
       this.setStatus('connected')
-      // 握手成功后立即清除 URL 中的 token（首次握手不可避免，之后 URL 保持干净）
-      this.clearTokenFromUrl()
     }
 
     ws.onmessage = (ev) => {
@@ -215,10 +171,6 @@ class WSBridge {
       }
       switch (msg?.type) {
         case 'ready':
-          // 记录服务端下发的消息上限（invoke 预检用；未下发时保持默认 4MB）
-          if (typeof msg.maxMsgBytes === 'number' && msg.maxMsgBytes > 0) {
-            this.serverMaxMsgBytes = msg.maxMsgBytes
-          }
           if (this.readyResolve) {
             this.readyResolve()
             this.readyResolve = null
@@ -246,7 +198,6 @@ class WSBridge {
       if (ev.code === 1001 || ev.code === 4003) {
         // shutdown(1001) / 心跳超时(4003)：不再自动重连（等待页面刷新重新加载）
         this.closedByUser = true
-        this.clearSupersedeTimer()
         this.rejectAllPending(new Error(`ws closed by server (code ${ev.code})`))
         this.rejectReady(new Error(`ws closed by server (code ${ev.code})`))
         this.setStatus('closed', { code: ev.code, reason: 'closed by server' })
@@ -257,28 +208,13 @@ class WSBridge {
         // 而不是永久失效（否则用户在旧 tab 的操作全部本地失败）
         this.rejectAllPending(new Error('ws superseded by another connection, reconnecting…'))
         this.rejectReady(new Error('ws superseded by another connection, reconnecting…'))
-        this.clearSupersedeTimer()
-        this.supersedeCount++
-        if (this.supersedeCount >= 2) {
-          // 乒乓熔断：连续 2 次被顶替（多 tab 无限互顶）→ 停止自动重连，提示手动刷新
-          this.closedByUser = true
-          this.setStatus('closed', { code: 4002, reason: 'superseded repeatedly (multiple tabs), please refresh manually' })
-          return
-        }
         this.setStatus('reconnecting', { code: 4002, reason: 'superseded' })
         this.scheduleReconnect(5000)
         return
       }
-      // 断线/握手失败：reject 所有 pending + ready，保留 listeners
+      // 断线：reject 所有 pending + ready，保留 listeners
       this.rejectAllPending(new Error('ws disconnected, reconnecting…'))
       this.rejectReady(new Error('ws disconnected, reconnecting…'))
-      // 连续握手失败达到阈值 → 探测认证失败（token 无效 vs 服务器不可达）；
-      // 连接成功过同样适用（服务器换 token 重启后旧 token 会静默失效，需给出 auth-failed 出口）
-      this.handshakeFailStreak++
-      if (this.handshakeFailStreak >= 2) {
-        void this.probeAuthFailure()
-        return
-      }
       this.setStatus('reconnecting', { code: ev.code, reason: 'disconnected' })
       this.scheduleReconnect()
     }
@@ -290,42 +226,6 @@ class WSBridge {
         /* ignore */
       }
     }
-  }
-
-  private clearSupersedeTimer(): void {
-    if (this.supersedeResetTimer) {
-      clearTimeout(this.supersedeResetTimer)
-      this.supersedeResetTimer = null
-    }
-  }
-
-  /** 从当前 URL 清除 token 参数（resolveToken 与 onopen 共用；幂等） */
-  private clearTokenFromUrl(): void {
-    clearTokenFromUrlGlobal()
-  }
-
-  /** 认证失败探测：带 token 请求 /ws（无 Upgrade 头）区分 401（认证失败）与 429/403/其他（继续重连） */
-  private async probeAuthFailure(): Promise<void> {
-    // 探测期间先回退到 reconnecting 状态（避免停在 connecting 最长 5s 无提示）
-    this.setStatus('reconnecting', { reason: 'probing server' })
-    try {
-      const base = `${globalThis.location?.protocol ?? 'http:'}//${globalThis.location?.host ?? '127.0.0.1:6810'}`
-      // 超时保护：网络黑洞（防火墙 DROP）下 fetch 可能挂起，用 AbortSignal 限制 5s
-      const res = await fetch(`${base}/ws?token=${encodeURIComponent(this.token)}`, { cache: 'no-store', signal: AbortSignal.timeout(5000) })
-      if (res.status === 401) {
-        // 服务器在线且明确拒绝 token → 认证失败，停止自动重连，交由 token-gate 提示重新输入
-        this.closedByUser = true
-        this.rejectAllPending(new Error('authentication failed: invalid token'))
-        this.rejectReady(new Error('authentication failed: invalid token'))
-        this.setStatus('auth-failed', { reason: 'invalid token' })
-        return
-      }
-      // 429（限频）/403（Origin 拒绝）/400/503/其他：非 token 问题，继续网络重连
-    } catch {
-      /* 服务器不可达：按网络故障继续重连 */
-    }
-    this.setStatus('reconnecting', { reason: 'disconnected' })
-    this.scheduleReconnect()
   }
 
   private rejectAllPending(err: Error): void {
@@ -371,7 +271,6 @@ class WSBridge {
   /** 主动关闭（页面卸载时调用） */
   dispose(): void {
     this.closedByUser = true
-    this.clearSupersedeTimer()
     // #6 修复：dispose 时 reject 未完成 invoke 与未就绪 ready
     this.rejectAllPending(new Error('bridge disposed'))
     this.rejectReady(new Error('bridge disposed'))
@@ -393,38 +292,15 @@ class WSBridge {
     return args.slice(0, end)
   }
 
-  /** 服务端消息上限（供生成代码/外部读取） */
-  get maxMsgBytes(): number {
-    return this.serverMaxMsgBytes
-  }
-
-  /** 与 ipcRenderer.invoke 对齐：Promise 化调用；连接未就绪时自动重连并等待（最多 5s）
-   * 发送前预检帧大小：超过服务端 MAX_MSG_BYTES（默认 4MB）时直接失败并给出可见错误，
-   * 避免"发送后无反馈、120s 后超时"的静默失败（大附件场景）。 */
+  /** 与 ipcRenderer.invoke 对齐：Promise 化调用；连接未就绪时自动重连并等待（最多 5s） */
   invoke(channel: string, ...args: unknown[]): Promise<unknown> {
     const id = this.nextId++
     const trimmed = this.trimUndefinedArgs(args)
-    // 帧大小预检（对齐服务端 MAX_MSG_BYTES；ready 帧下发后使用服务端实际值）
-    const frameLimit = this.serverMaxMsgBytes
-    try {
-      const frameSize = new Blob([JSON.stringify({ type: 'invoke', id, channel, args: trimmed })]).size
-      if (frameSize > frameLimit) {
-        return Promise.reject(new Error(`message too large: ${frameSize} bytes (max ${frameLimit})`))
-      }
-    } catch {
-      /* 序列化失败交由 sendRaw 路径处理 */
-    }
     return new Promise<unknown>((resolve, reject) => {
-      const sendIfOpen = (): boolean => {
+      const sendIfOpen = (): void => {
         if (this.ws?.readyState === WebSocket.OPEN) {
           this.pending.set(id, { resolve, reject })
-          try {
-            this.sendRaw({ type: 'invoke', id, channel, args: trimmed })
-          } catch (e) {
-            // 帧序列化失败：清理刚建的 pending，避免泄漏（warn 留痕）
-            this.pending.delete(id)
-            reject(e instanceof Error ? e : new Error(String(e)))
-          }
+          this.sendRaw({ type: 'invoke', id, channel, args: trimmed })
           return true
         }
         return false
@@ -459,31 +335,16 @@ class WSBridge {
     }
   }
 
-  /** sendSync 兼容：返回缓存值（首次乐观 true），后台异步 invoke 更新缓存（缓存键含参数，序列化失败时降级为 channel-only） */
+  /** sendSync 兼容：返回缓存值（首次乐观 true），后台异步 invoke 更新缓存 */
   sendSync(channel: string, ...args: unknown[]): unknown {
-    let key: string
-    try {
-      key = channel + '\u0000' + JSON.stringify(args)
-    } catch {
-      // args 不可序列化（循环引用等）：降级为 channel-only 键，避免同步抛异常
-      key = channel
-    }
-    // 缓存容量上限（防止不同 args 调用无限增长）；超限删除最旧键
-    if (this.syncCache.size >= 100) {
-      const oldest = this.syncCache.keys().next().value
-      if (oldest !== undefined) this.syncCache.delete(oldest)
-    }
     this.invoke(channel, ...args)
-      .then((v) => this.syncCache.set(key, v))
-      .catch((e) => {
-        // sendSync 乐观返回无法回滚，至少留痕（避免"保存成功"实为失败时无任何线索）
-        console.warn(`[bridge] sendSync ${channel} failed:`, e instanceof Error ? e.message : e)
-      })
-    if (!this.syncCache.has(key)) {
+      .then((v) => this.syncCache.set(channel, v))
+      .catch(() => {})
+    if (!this.syncCache.has(channel)) {
       // 首次调用：乐观返回 true（设置/草稿保存类语义，避免 renderer 走失败 fallback）
       return true
     }
-    return this.syncCache.get(key)
+    return this.syncCache.get(channel)
   }
 
   private settle(id: number | string, msg: { ok: boolean; result?: unknown; error?: string }): void {
@@ -578,13 +439,6 @@ export const webUtils = {
 
 /** 单例：生成的 web-preload 从这里 import ipcRenderer */
 export const ipcRenderer = new WSBridge(resolveWsUrl())
-
-// 暴露连接状态给 server 注入的页面脚本（连接指示条 / 认证失败重试遮罩）
-;(globalThis as any).__PROMA_BRIDGE_STATUS__ = {
-  onStatusChange: (fn: StatusListener) => ipcRenderer.onStatusChange(fn),
-  offStatusChange: (fn: StatusListener) => ipcRenderer.offStatusChange(fn),
-  getStatus: () => ipcRenderer.status,
-}
 
 // 页面卸载时主动断开，避免僵尸连接占住单活跃名额
 if (typeof globalThis.addEventListener === 'function') {

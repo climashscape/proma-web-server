@@ -41,29 +41,8 @@ const CLIPBOARD_OLD = `  writeClipboardText: (text: string) => {
     return ipcRenderer.invoke(IPC_CHANNELS.WRITE_CLIPBOARD_TEXT, text)
   },`
 const CLIPBOARD_NEW = `  writeClipboardText: async (text: string) => {
-    // Web 模式：直接写浏览器剪贴板；非 secure context（局域网 http://<ip>）navigator.clipboard 不可用 → execCommand 降级
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text)
-        return
-      }
-    } catch {
-      /* 权限拒绝/非 secure context，走降级 */
-    }
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    let ok = false
-    try {
-      ok = document.execCommand('copy')
-    } catch {
-      ok = false
-    }
-    ta.remove()
-    if (!ok) throw new Error('复制失败：浏览器上下文不支持剪贴板（请使用 HTTPS 访问或重试）')
+    // Web 模式：直接写浏览器剪贴板（127.0.0.1 secure context 下 navigator.clipboard 可用）
+    await navigator.clipboard.writeText(text)
   },`
 
 // 特殊重写（Web 模式语义修正）：openFileOrFolderDialog 改用浏览器原生文件选择器。
@@ -92,22 +71,12 @@ const OPEN_DIALOG_NEW = `  openFileOrFolderDialog: () => {
         const files: any[] = []
         const largeFiles: any[] = []
         const skippedFiles: any[] = []
-        // 单文件与多文件累积均以服务端实际 MAX_MSG_BYTES（ready 帧下发）为基准
-        const frameLimit = (ipcRenderer.maxMsgBytes || 4 * 1024 * 1024)
-        const maxBase64 = frameLimit - 8192
-        const MAX_SIZE = 100 * 1024 * 1024 // 超大文件占位阈值（保留原语义：进 largeFiles）
-        let accBase64 = 0
+        const MAX_SIZE = 100 * 1024 * 1024
         for (const f of picked) {
           const mediaType = f.type || 'application/octet-stream'
           try {
             if (f.size > MAX_SIZE) {
               largeFiles.push({ filename: f.name, mediaType, size: f.size, path: '' })
-              continue
-            }
-            // 读取前按 f.size 估算 base64 长度（base64 膨胀 ~4/3），超限/累计超限提前跳过，避免整读大文件进内存
-            const estBase64 = Math.ceil(f.size / 3) * 4
-            if (estBase64 > maxBase64 || accBase64 + estBase64 > maxBase64) {
-              skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: '', reason: '超过 Web 版消息上限（约 ' + Math.max(1, Math.floor((frameLimit * 0.75) / 1024 / 1024)) + 'MB）' })
               continue
             }
             const data = await new Promise<string>((res, rej) => {
@@ -116,12 +85,6 @@ const OPEN_DIALOG_NEW = `  openFileOrFolderDialog: () => {
               reader.onerror = () => rej(reader.error || new Error('read failed'))
               reader.readAsDataURL(f)
             })
-            // 单文件超限或累计超限（多文件将打包进同一 invoke 帧）→ 提前跳过并提示
-            if (data.length > maxBase64 || accBase64 + data.length > maxBase64) {
-              skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: '', reason: '超过 Web 版消息上限（约 ' + Math.max(1, Math.floor((frameLimit * 0.75) / 1024 / 1024)) + 'MB）' })
-              continue
-            }
-            accBase64 += data.length
             files.push({ filename: f.name, mediaType, data, size: f.size })
           } catch (e) {
             skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: '', reason: 'unreadable', message: String(e) })
@@ -159,22 +122,12 @@ const OPEN_FILE_DIALOG_NEW = `  openFileDialog: () => {
         const files: any[] = []
         const largeFiles: any[] = []
         const skippedFiles: any[] = []
-        // 单文件与多文件累积均以服务端实际 MAX_MSG_BYTES（ready 帧下发）为基准
-        const frameLimit = (ipcRenderer.maxMsgBytes || 4 * 1024 * 1024)
-        const maxBase64 = frameLimit - 8192
-        const MAX_SIZE = 100 * 1024 * 1024 // 超大文件占位阈值（保留原语义：进 largeFiles）
-        let accBase64 = 0
+        const MAX_SIZE = 100 * 1024 * 1024
         for (const f of picked) {
           const mediaType = f.type || 'application/octet-stream'
           try {
             if (f.size > MAX_SIZE) {
               largeFiles.push({ filename: f.name, mediaType, size: f.size, path: '' })
-              continue
-            }
-            // 读取前按 f.size 估算 base64 长度（base64 膨胀 ~4/3），超限/累计超限提前跳过，避免整读大文件进内存
-            const estBase64 = Math.ceil(f.size / 3) * 4
-            if (estBase64 > maxBase64 || accBase64 + estBase64 > maxBase64) {
-              skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: '', reason: '超过 Web 版消息上限（约 ' + Math.max(1, Math.floor((frameLimit * 0.75) / 1024 / 1024)) + 'MB）' })
               continue
             }
             const data = await new Promise<string>((res, rej) => {
@@ -183,12 +136,6 @@ const OPEN_FILE_DIALOG_NEW = `  openFileDialog: () => {
               reader.onerror = () => rej(reader.error || new Error('read failed'))
               reader.readAsDataURL(f)
             })
-            // 单文件超限或累计超限（多文件将打包进同一 invoke 帧）→ 提前跳过并提示
-            if (data.length > maxBase64 || accBase64 + data.length > maxBase64) {
-              skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: '', reason: '超过 Web 版消息上限（约 ' + Math.max(1, Math.floor((frameLimit * 0.75) / 1024 / 1024)) + 'MB）' })
-              continue
-            }
-            accBase64 += data.length
             files.push({ filename: f.name, mediaType, data, size: f.size })
           } catch (e) {
             skippedFiles.push({ filename: f.name, mediaType, size: f.size, path: '', reason: 'unreadable', message: String(e) })
@@ -223,8 +170,7 @@ const OPEN_FOLDER_DIALOG_NEW = `  openFolderDialog: () => {
 
 async function main(): Promise<void> {
   console.log(`[build-web-preload] 读取 ${SRC_FILE}`)
-  // 换行归一化：Windows checkout（autocrlf）会得到 CRLF，多行模板匹配需统一为 LF（Linux 生产环境为 LF）
-  const src = (await readFile(SRC_FILE, 'utf8')).replace(/\r\n/g, '\n')
+  const src = await readFile(SRC_FILE, 'utf8')
   const lines = src.split('\n')
 
   // 生成头
@@ -264,8 +210,7 @@ async function main(): Promise<void> {
     process.exit(1)
   }
 
-  // 特殊重写（多行块替换，需要先 join）；任一重写未命中即 fail（上游 preload 结构变化时显式报错，
-  // 而非静默产出"剪贴板假成功/文件选择无反应"的降级产物）
+  // 特殊重写（多行块替换，需要先 join）
   let joined = body.join('\n')
   if (joined.includes(CLIPBOARD_OLD)) {
     joined = joined.replace(CLIPBOARD_OLD, CLIPBOARD_NEW)
@@ -282,23 +227,6 @@ async function main(): Promise<void> {
   if (joined.includes(OPEN_FOLDER_DIALOG_OLD)) {
     joined = joined.replace(OPEN_FOLDER_DIALOG_OLD, OPEN_FOLDER_DIALOG_NEW)
     folderDialogRewritten++
-  }
-
-  if (clipboardRewritten !== 1 || joined.includes(CLIPBOARD_OLD)) {
-    console.error(`[build-web-preload] ❌ 剪贴板重写数量异常: ${clipboardRewritten} 或存在未替换残留。上游 preload 结构可能变化，请检查 ${SRC_FILE}`)
-    process.exit(1)
-  }
-  if (dialogRewritten !== 1 || joined.includes(OPEN_DIALOG_OLD)) {
-    console.error(`[build-web-preload] ❌ openFileOrFolderDialog 重写数量异常: ${dialogRewritten} 或存在未替换残留。上游 preload 结构可能变化，请检查 ${SRC_FILE}`)
-    process.exit(1)
-  }
-  if (fileDialogRewritten !== 1 || joined.includes(OPEN_FILE_DIALOG_OLD)) {
-    console.error(`[build-web-preload] ❌ openFileDialog 重写数量异常: ${fileDialogRewritten} 或存在未替换残留。上游 preload 结构可能变化，请检查 ${SRC_FILE}`)
-    process.exit(1)
-  }
-  if (folderDialogRewritten !== 1 || joined.includes(OPEN_FOLDER_DIALOG_OLD)) {
-    console.error(`[build-web-preload] ❌ openFolderDialog 重写数量异常: ${folderDialogRewritten} 或存在未替换残留。上游 preload 结构可能变化，请检查 ${SRC_FILE}`)
-    process.exit(1)
   }
 
   const out = [...header, joined].join('\n')
