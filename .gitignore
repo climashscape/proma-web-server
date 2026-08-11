@@ -31,3 +31,4 @@ Thumbs.db
 
 # git worktrees（开发基础设施，不入库）
 .worktrees
+server/certs/

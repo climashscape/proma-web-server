@@ -20,10 +20,12 @@
 
 import { join, extname, resolve, dirname } from 'node:path'
 import { readFile } from 'node:fs/promises'
+import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
+import { spawn, execSync } from 'node:child_process'
 
-import { setEventBroadcast, invokeChannel, listRegisteredChannels, ipcMain } from './electron-stub'
+import { setEventBroadcast, invokeChannel, listRegisteredChannels, ipcMain, BrowserWindow } from './electron-stub'
 import { logger } from './logger'
 import {
   PROTOCOL_VERSION,
@@ -38,6 +40,22 @@ import {
 
 const PORT = Number(process.env.PROMA_WEB_PORT || 6810)
 const HOST = process.env.PROMA_WEB_HOST || '127.0.0.1'
+
+// 可选 HTTPS（语音输入等 secure-context-only API 需要）：
+// PROMA_WEB_TLS_CERT / PROMA_WEB_TLS_KEY 指向 PEM 证书与私钥文件；
+// 两者都存在时 Bun.serve 以 HTTPS 监听，否则回退 HTTP。
+const TLS_CERT = process.env.PROMA_WEB_TLS_CERT || ''
+const TLS_KEY = process.env.PROMA_WEB_TLS_KEY || ''
+const tlsOptions: { cert?: string; key?: string } = {}
+if (TLS_CERT && TLS_KEY) {
+  try {
+    tlsOptions.cert = readFileSync(TLS_CERT, 'utf8')
+    tlsOptions.key = readFileSync(TLS_KEY, 'utf8')
+  } catch (err) {
+    console.error('[server] 读取 TLS 证书失败，回退 HTTP:', err instanceof Error ? err.message : err)
+  }
+}
+const isTls = Boolean(tlsOptions.cert && tlsOptions.key)
 const PROMA_SRC = process.env.PROMA_SRC
 if (!PROMA_SRC) {
   console.error('[server] 必须设置 PROMA_SRC 环境变量指向 Proma 源码（patch 后的目录）')
@@ -119,6 +137,12 @@ async function loadPromaMain(): Promise<void> {
     // 动态 import 真实 ipc.ts（内部 import 'electron' 由 @proma/electron-stub patch 提供）
     const ipcModule = await import(join(PROMA_SRC, 'apps/electron/src/main/ipc.ts'))
     ipcModule.registerIpcHandlers()
+    // Web 模式语音输入链路修复：桌面版 toggleVoiceDictationWindow 依赖 getMainWindow()
+    // （main-window-store），Web 模式无人调用 setMainWindow → store 为 null → handler
+    // 静默 return（不发 SHOWN 事件），表现为点击语音按钮完全没反应。
+    // 这里注册一个 stub 主窗口，让 mainWindow.webContents.send() 经 broadcastFn 推送到
+    // renderer WS 连接（等价于 Electron 的 webContents.send → renderer 收到 SHOWN 事件）。
+    await registerWebMainWindow()
   } catch (err) {
     // M1 修复：启动失败给友好诊断，而非裸崩
     const e = err instanceof Error ? err : new Error(String(err))
@@ -133,6 +157,24 @@ async function loadPromaMain(): Promise<void> {
 
   registeredChannelCount = listRegisteredChannels().length
   logger.info('ipc handlers registered', { count: registeredChannelCount, ms: Date.now() - t0 })
+}
+
+/**
+ * Web 模式：向 main-window-store 注册 stub 主窗口（语音输入链路用）。
+ *
+ * 不修改 renderer 与 proma-src 源码；stub BrowserWindow 的 webContents.send 走全局
+ * broadcastFn（server.ts setEventBroadcast），SHOWN/TOGGLE_STOP/STATE/TRANSCRIPT 等
+ * 事件会像 Electron 主进程一样推送到已连接的 renderer。
+ */
+async function registerWebMainWindow(): Promise<void> {
+  try {
+    const { setMainWindow } = await import(join(PROMA_SRC, 'apps/electron/src/main/lib/main-window-store.ts'))
+    setMainWindow(new BrowserWindow({ show: false }))
+    logger.info('web main window registered (voice-dictation stub)')
+  } catch (err) {
+    const e = err instanceof Error ? err : new Error(String(err))
+    logger.warn('register web main window failed', { error: e.message })
+  }
 }
 
 /** P1 测试模式 handler（PROMA_WEB_TEST_MODE=1 时注册；生产默认关闭） */
@@ -164,6 +206,230 @@ function registerWebCompatHandlers(): void {
   // Agent 灵动岛仅 macOS 原生 surface 使用；Web 模式 renderer 仍会调用 markSessionViewed
   ipcMain.handle('agent-island:mark-session-viewed', () => true)
   logger.info('web compat handlers registered')
+}
+
+// ===================== NAS 自更新 handler =====================
+//
+// 应用内自更新：git fetch（走代理）→ 对比版本 → spawn update-proma.sh 执行
+// 完整更新流程（备份/checkout/patch/bun install/vite build/重建 web-preload）。
+// 仅注册在 server.ts 层（不修改上游 apps/electron/src/main/ipc.ts）。
+//
+// 状态推送：server.ts 的 setEventBroadcast 会把 renderer 订阅的事件帧发给 activeClient，
+// 这里用本地 sendEvent 直接向当前连接的 renderer 推送 nas-updater:status-changed。
+
+type NasUpdateStatus =
+  | { status: 'idle' }
+  | { status: 'checking' }
+  | { status: 'available'; currentVersion: string; newVersion: string; releaseNotes?: string; commitHash: string }
+  | { status: 'not-available'; currentVersion: string }
+  | { status: 'building'; step: string; progress: number }
+  | { status: 'done'; newVersion: string }
+  | { status: 'error'; error: string; rollback?: boolean }
+
+// NAS 环境路径（与 bin/proma-web 启动脚本保持一致）
+const NAS_PKGVAR = (() => {
+  // PROMA_WEB_USER_DATA=${PKGVAR}/data（proma-web 设置），取上层目录
+  const raw = process.env.PROMA_WEB_USER_DATA
+  if (raw) {
+    const trimmed = raw.replace(/\/data$/, '')
+    if (trimmed) return trimmed
+  }
+  return '/vol1/@appdata/proma'
+})()
+const NAS_PROMA_SRC = process.env.PROMA_SRC || `${NAS_PKGVAR}/Proma`
+const NAS_APP_DEST = '/vol1/@appcenter/proma'
+const NAS_UPDATE_SCRIPT = `${NAS_APP_DEST}/bin/update-proma.sh`
+const NAS_STATUS_FILE = `${NAS_PKGVAR}/.update-status`
+const NAS_BACKUP_DIR = `${NAS_PKGVAR}/.backup`
+const NAS_GIT_PROXY = process.env.NAS_GIT_PROXY || 'http://192.168.66.2:7890'
+
+let nasUpdateStatus: NasUpdateStatus = { status: 'idle' }
+let nasUpdateProcess: ReturnType<typeof spawn> | null = null
+
+/** 向当前活跃 renderer 连接推送事件帧（等价 setEventBroadcast 回调逻辑） */
+function sendEvent(channel: string, ...payload: unknown[]): void {
+  const frame = { type: 'event', channel, payload }
+  if (activeClient) {
+    metrics.eventsSent++
+    sendFrame(activeClient, frame)
+  }
+}
+
+function setNasUpdateStatus(status: NasUpdateStatus): void {
+  nasUpdateStatus = status
+  // 写状态文件（持久化，进程重启后可恢复）
+  try {
+    writeFileSync(NAS_STATUS_FILE, JSON.stringify(status, null, 2))
+  } catch { /* 状态文件写失败不阻断 */ }
+  sendEvent('nas-updater:status-changed', status)
+}
+
+function getNasCurrentVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(NAS_PROMA_SRC, 'apps/electron/package.json'), 'utf-8'))
+    return String(pkg.version ?? 'unknown')
+  } catch {
+    return 'unknown'
+  }
+}
+
+function getNasGitCommitHash(): string {
+  try {
+    return execSync('git rev-parse --short HEAD', { cwd: NAS_PROMA_SRC, encoding: 'utf-8' }).trim()
+  } catch {
+    return 'unknown'
+  }
+}
+
+function registerNasUpdaterIpc(): void {
+  // 检查更新
+  ipcMain.handle('nas-updater:check', async (): Promise<void> => {
+    if (nasUpdateStatus.status === 'building') {
+      logger.warn('nas-updater: skip check, already building')
+      return
+    }
+    // 非 git 部署（如首次 tar.gz 解压无 .git）无法自更新
+    if (!existsSync(join(NAS_PROMA_SRC, '.git'))) {
+      setNasUpdateStatus({ status: 'error', error: '当前安装非 git 方式部署，无法自更新，请重新安装支持自更新的版本' })
+      return
+    }
+    setNasUpdateStatus({ status: 'checking' })
+    try {
+      // git fetch（走旁路由代理）
+      execSync(
+        `git -c http.proxy=${NAS_GIT_PROXY} -c https.proxy=${NAS_GIT_PROXY} fetch origin`,
+        { cwd: NAS_PROMA_SRC, timeout: 120_000, encoding: 'utf-8' }
+      )
+      // 读取远程最新 apps/electron/package.json version（不 merge）
+      const remoteVersion = execSync(
+        `git show origin/main:apps/electron/package.json`,
+        { cwd: NAS_PROMA_SRC, timeout: 30_000, encoding: 'utf-8' }
+      )
+      const remotePkg = JSON.parse(remoteVersion)
+      const remoteCommit = execSync(
+        `git rev-parse --short origin/main`,
+        { cwd: NAS_PROMA_SRC, encoding: 'utf-8' }
+      ).trim()
+
+      const current = getNasCurrentVersion()
+      const remote = String(remotePkg.version ?? '')
+
+      if (remote !== current) {
+        // 尝试获取 release notes（git log 两个 commit 之间的消息）
+        let releaseNotes = ''
+        try {
+          releaseNotes = execSync(
+            `git log --oneline --no-merges ${getNasGitCommitHash()}..origin/main`,
+            { cwd: NAS_PROMA_SRC, encoding: 'utf-8', timeout: 10_000 }
+          ).trim()
+        } catch { /* releaseNotes 为空时 UI 不展示 */ }
+
+        setNasUpdateStatus({
+          status: 'available',
+          currentVersion: current,
+          newVersion: remote,
+          releaseNotes,
+          commitHash: remoteCommit,
+        })
+      } else {
+        setNasUpdateStatus({ status: 'not-available', currentVersion: current })
+      }
+    } catch (err) {
+      const e = err instanceof Error ? err : new Error(String(err))
+      logger.error('nas-updater: check failed', { error: e.message })
+      setNasUpdateStatus({ status: 'error', error: e.message })
+    }
+  })
+
+  // 执行更新
+  ipcMain.handle('nas-updater:apply', async (): Promise<boolean> => {
+    if (nasUpdateStatus.status !== 'available') {
+      logger.warn('nas-updater: skip apply, not in available state')
+      return false
+    }
+    if (nasUpdateProcess) {
+      logger.warn('nas-updater: update already in progress')
+      return false
+    }
+
+    const targetVersion = nasUpdateStatus.newVersion
+    const targetCommit = nasUpdateStatus.commitHash
+
+    setNasUpdateStatus({ status: 'building', step: '启动更新脚本', progress: 0 })
+
+    // 启动更新脚本（非阻塞，通过 stdout 解析进度）
+    nasUpdateProcess = spawn('bash', [NAS_UPDATE_SCRIPT], {
+      cwd: NAS_APP_DEST,
+      env: {
+        ...process.env,
+        PROMA_SRC: NAS_PROMA_SRC,
+        PKGVAR: NAS_PKGVAR,
+        APP_DEST: NAS_APP_DEST,
+        TARGET_COMMIT: targetCommit,
+        HTTP_PROXY: NAS_GIT_PROXY,
+        HTTPS_PROXY: NAS_GIT_PROXY,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    const stepPattern = /\[STEP\] (.+)/
+    const progressPattern = /\[PROGRESS\] (\d+)/
+
+    nasUpdateProcess.stdout?.on('data', (data: Buffer) => {
+      const text = data.toString('utf-8')
+      for (const line of text.split('\n')) {
+        const stepMatch = line.match(stepPattern)
+        if (stepMatch) {
+          setNasUpdateStatus({ status: 'building', step: stepMatch[1], progress: 0 })
+        }
+        const progressMatch = line.match(progressPattern)
+        if (progressMatch) {
+          setNasUpdateStatus({ status: 'building', step: '', progress: parseInt(progressMatch[1], 10) })
+        }
+        if (line.trim()) logger.info('nas-updater', { line })
+      }
+    })
+
+    nasUpdateProcess.stderr?.on('data', (data: Buffer) => {
+      logger.error('nas-updater stderr', { text: data.toString('utf-8') })
+    })
+
+    return new Promise<boolean>((resolve) => {
+      nasUpdateProcess!.on('exit', (code: number | null) => {
+        nasUpdateProcess = null
+        if (code === 0) {
+          setNasUpdateStatus({ status: 'done', newVersion: targetVersion })
+          resolve(true)
+        } else {
+          // 检查是否已自动回滚
+          const rolledBack = existsSync(`${NAS_BACKUP_DIR}/.rollback-done`)
+          setNasUpdateStatus({
+            status: 'error',
+            error: `更新脚本退出码 ${code}`,
+            rollback: rolledBack,
+          })
+          resolve(false)
+        }
+      })
+    })
+  })
+
+  // 获取状态
+  ipcMain.handle('nas-updater:get-status', async (): Promise<NasUpdateStatus> => {
+    // 如果 server 重启过，从状态文件恢复
+    if (nasUpdateStatus.status === 'idle') {
+      try {
+        const saved = readFileSync(NAS_STATUS_FILE, 'utf-8')
+        const parsed = JSON.parse(saved) as NasUpdateStatus
+        if (parsed.status === 'done' || parsed.status === 'error') {
+          nasUpdateStatus = parsed
+        }
+      } catch { /* 无状态文件或解析失败保持 idle */ }
+    }
+    return nasUpdateStatus
+  })
+
+  logger.info('nas-updater handlers registered', { src: NAS_PROMA_SRC, script: NAS_UPDATE_SCRIPT })
 }
 
 // ===================== 指标（轻量 /metrics） =====================
@@ -422,6 +688,53 @@ const MIME: Record<string, string> = {
 // 无 token 时显示登录遮罩引导输入（输入后存 localStorage 刷新）。
 
 const WEB_PRELOAD_PATH = '/web-preload.js'
+
+// Web 兼容 polyfill（注入在 web-preload 之前，非 secure context 兜底）：
+// 1. crypto.randomUUID：Chromium 仅在 secure context（HTTPS/localhost）暴露；
+//    HTTP 局域网访问（如 http://192.168.66.34:1610）下 undefined，语音链路
+//    startRecording 调 crypto.randomUUID() 会 TypeError → 静默失败。
+// 2. navigator.mediaDevices.getUserMedia：同样仅 secure context 可用；
+//    非 secure 时降级为明确拒绝，避免 undefined 抛错，并给出可读提示。
+// 3. 语音状态 error → 页面级提示条（SpeechButton 在 error 态无 UI 反馈，
+//    用户会误以为“点击没反应”）。
+const WEB_COMPAT_POLYFILL_SCRIPT = `
+<script>
+(function () {
+  try {
+    if (typeof crypto.randomUUID !== 'function') {
+      crypto.randomUUID = function () {
+        var b = crypto.getRandomValues(new Uint8Array(16));
+        b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+        var h = '';
+        for (var i = 0; i < 16; i++) { var v = b[i].toString(16); h += v.length === 1 ? '0' + v : v; }
+        return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+      };
+    }
+    if (window.isSecureContext === false) {
+      if (!navigator.mediaDevices) { navigator.mediaDevices = {}; }
+      if (typeof navigator.mediaDevices.getUserMedia !== 'function') {
+        navigator.mediaDevices.getUserMedia = function () {
+          return Promise.reject(new Error('当前为 HTTP 非安全访问，浏览器禁止麦克风采集。请改用 HTTPS 或 localhost 访问。'));
+        };
+        navigator.mediaDevices.enumerateDevices = function () { return Promise.resolve([]); };
+      }
+    }
+  } catch (e) { /* polyfill 失败不阻塞页面 */ }
+  // 语音输入 error → 页面级提示条（error 态 SpeechButton 无渲染，需可见反馈）
+  try {
+    window.addEventListener('proma:voice-dictation-status', function (ev) {
+      var d = ev && ev.detail;
+      if (!d || d.status !== 'error' || !d.message) return;
+      var div = document.createElement('div');
+      div.textContent = '语音输入失败: ' + d.message;
+      div.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:99999;background:#b91c1c;color:#fff;padding:10px 16px;border-radius:8px;font-size:13px;line-height:1.5;box-shadow:0 4px 12px rgba(0,0,0,.3);max-width:90vw;text-align:center';
+      document.body.appendChild(div);
+      setTimeout(function () { if (div.parentNode) div.parentNode.removeChild(div); }, 6000);
+    });
+  } catch (e) { /* 忽略 */ }
+})();
+</script>
+`
 
 // ===================== 移动端 UA 检测（阶段 4：renderer 移动端适配） =====================
 //
@@ -1086,7 +1399,7 @@ function injectWebShell(html: string, mobile?: MobileInfo): string {
   const mobileCss = mobile?.isMobile ? MOBILE_CSS + '\n' : ''
   const mobileUi = mobile?.isMobile ? MOBILE_UI_SCRIPT + '\n' : ''
   const inject =
-    `<script src="${WEB_PRELOAD_PATH}"></script>\n${TOKEN_GATE_SCRIPT}\n${MOBILE_DETECT_SCRIPT}\n${mobileUi}</head>`
+    `${WEB_COMPAT_POLYFILL_SCRIPT}<script src="${WEB_PRELOAD_PATH}"></script>\n${TOKEN_GATE_SCRIPT}\n${MOBILE_DETECT_SCRIPT}\n${mobileUi}</head>`
   // WEB_SHELL_CSS 无条件注入（窗口控件在 Web 版一律隐藏）；其余移动端增强仅手机/移动注入
   const headInject = WEB_SHELL_CSS + '\n' + mobileMeta + mobileCss + inject
   if (html.includes('</head>')) return html.replace('</head>', headInject)
@@ -1149,6 +1462,7 @@ async function shutdown(signal: string): Promise<void> {
 
   // B5：serverRef 守卫（启动期可能未赋值）
   if (serverRef) serverRef.stop(true)
+  if (tlsServerRef) tlsServerRef.stop(true)
 
   logger.info('shutdown complete')
   process.exit(0)
@@ -1182,33 +1496,36 @@ process.on('unhandledRejection', (reason) => {
 
 await loadPromaMain()
 registerWebCompatHandlers()
+registerNasUpdaterIpc()
 registerTestHandlers()
 
 let serverRef: import('bun').Server
+let tlsServerRef: import('bun').Server | null = null
 
-try {
-  serverRef = Bun.serve({
-    port: PORT,
-    hostname: HOST,
-    async fetch(req, srv) {
-      const url = new URL(req.url)
+// ===================== HTTP/HTTPS 双端口（共享 fetch + websocket） =====================
+// HTTP 端口保持兼容（语音输入在 HTTP 非 secure context 下受浏览器限制）；
+// 设置 PROMA_WEB_TLS_CERT/KEY 时主端口变 HTTPS；设置 PROMA_WEB_TLS_PORT 时
+// 额外监听 HTTPS 端口（与 HTTP 并存，语音输入走 HTTPS 才能用真实麦克风）。
 
-      // WebSocket 升级（Token 认证 + M7 连接限频 + #28 Origin 校验）
-      if (url.pathname === '/ws') {
-        const token = url.searchParams.get('token')
-        if (token !== WS_TOKEN) {
-          return new Response('unauthorized: bad or missing token', { status: 401 })
-        }
-        if (!originAllowed(req)) {
-          logger.warn('origin not allowed', { origin: req.headers.get('origin') })
-          return new Response('forbidden: origin not allowed', { status: 403 })
-        }
-        const ip = srv.requestIP(req)?.address ?? 'unknown'
-        if (connRateLimited(ip)) {
-          logger.warn('connection rate limited', { ip })
-          return new Response('too many connections, slow down', { status: 429 })
-        }
-        if (srv.upgrade(req)) return undefined
+const fetchFn = async (req: Request, srv: import('bun').Server): Promise<Response | undefined> => {
+  const url = new URL(req.url)
+
+  // WebSocket 升级（Token 认证 + M7 连接限频 + #28 Origin 校验）
+  if (url.pathname === '/ws') {
+    const token = url.searchParams.get('token')
+    if (token !== WS_TOKEN) {
+      return new Response('unauthorized: bad or missing token', { status: 401 })
+    }
+    if (!originAllowed(req)) {
+      logger.warn('origin not allowed', { origin: req.headers.get('origin') })
+      return new Response('forbidden: origin not allowed', { status: 403 })
+    }
+    const ip = srv.requestIP(req)?.address ?? 'unknown'
+    if (connRateLimited(ip)) {
+      logger.warn('connection rate limited', { ip })
+      return new Response('too many connections, slow down', { status: 429 })
+    }
+    if (srv.upgrade(req)) return undefined
         return new Response('upgrade failed', { status: 400 })
       }
 
@@ -1237,85 +1554,98 @@ try {
 
       // 静态 UI（服务端移动端预判：决定是否注入移动端 viewport/CSS）
       return serveStatic(url.pathname, detectMobileUA(req.headers.get('user-agent')))
-    },
-    websocket: {
-      open(ws) {
-        allClients.add(ws)
-        // 单活跃连接互斥：新连接顶替旧连接
-        if (activeClient && activeClient !== ws) {
-          try {
-            sendFrame(activeClient, { type: 'bye', reason: 'superseded by a new connection' })
-            activeClient.close(4002, 'superseded')
-          } catch {
-            /* ignore */
-          }
-          cleanupClient(activeClient)
-        }
-        activeClient = ws
-        metrics.connectionsTotal++
-        const st = getState(ws)
-        st.connectedAt = Date.now()
-        st.lastSeen = Date.now()
-        sendFrame(ws, {
-          type: 'ready',
-          protocol: PROTOCOL_VERSION,
-          channels: listRegisteredChannels(),
-          server: {
-            name: PROTOCOL_NAME,
-            version: SERVER_VERSION,
-            pid: process.pid,
-            uptime: Math.floor((Date.now() - START_TIME) / 1000),
-          },
-        })
-        logger.info('ws client connected', { conn: st.connectedAt })
+    }
+
+const websocketConfig = {
+  open: (ws: import('bun').ServerWebSocket<unknown>): void => {
+    allClients.add(ws)
+    // 单活跃连接互斥：新连接顶替旧连接
+    if (activeClient && activeClient !== ws) {
+      try {
+        sendFrame(activeClient, { type: 'bye', reason: 'superseded by a new connection' })
+        activeClient.close(4002, 'superseded')
+      } catch {
+        /* ignore */
+      }
+      cleanupClient(activeClient)
+    }
+    activeClient = ws
+    metrics.connectionsTotal++
+    const st = getState(ws)
+    st.connectedAt = Date.now()
+    st.lastSeen = Date.now()
+    sendFrame(ws, {
+      type: 'ready',
+      protocol: PROTOCOL_VERSION,
+      channels: listRegisteredChannels(),
+      server: {
+        name: PROTOCOL_NAME,
+        version: SERVER_VERSION,
+        pid: process.pid,
+        uptime: Math.floor((Date.now() - START_TIME) / 1000),
       },
-      message(ws, raw) {
-        const st = getState(ws)
-        st.lastSeen = Date.now()
+    })
+    logger.info('ws client connected', { conn: st.connectedAt })
+  },
+  message: (ws: import('bun').ServerWebSocket<unknown>, raw: string | Buffer): void => {
+    const st = getState(ws)
+    st.lastSeen = Date.now()
 
-        const size = typeof raw === 'string' ? Buffer.byteLength(raw) : raw.byteLength
-        metrics.bytesReceived += size
-        if (size > MAX_MSG_BYTES) {
-          sendFrame(ws, { type: 'error', code: ERR.MSG_TOO_LARGE, message: `message too large: ${size} bytes (max ${MAX_MSG_BYTES})` })
-          return
-        }
+    const size = typeof raw === 'string' ? Buffer.byteLength(raw) : raw.byteLength
+    metrics.bytesReceived += size
+    if (size > MAX_MSG_BYTES) {
+      sendFrame(ws, { type: 'error', code: ERR.MSG_TOO_LARGE, message: `message too large: ${size} bytes (max ${MAX_MSG_BYTES})` })
+      return
+    }
 
-        let msg: unknown
-        try {
-          msg = JSON.parse(String(raw))
-        } catch {
-          sendFrame(ws, { type: 'error', code: ERR.BAD_JSON, message: 'invalid json' })
-          return
-        }
+    let msg: unknown
+    try {
+      msg = JSON.parse(String(raw))
+    } catch {
+      sendFrame(ws, { type: 'error', code: ERR.BAD_JSON, message: 'invalid json' })
+      return
+    }
 
-        if (typeof msg !== 'object' || msg === null || Array.isArray(msg)) {
-          // #14 P2：非法帧返回 error（数组也是 object，需显式排除）
-          sendFrame(ws, { type: 'error', code: 'invalid_frame', message: 'frame must be a JSON object' })
-          return
-        }
-        const frame = msg as Record<string, unknown>
+    if (typeof msg !== 'object' || msg === null || Array.isArray(msg)) {
+      // #14 P2：非法帧返回 error（数组也是 object，需显式排除）
+      sendFrame(ws, { type: 'error', code: 'invalid_frame', message: 'frame must be a JSON object' })
+      return
+    }
+    const frame = msg as Record<string, unknown>
 
-        switch (frame.type) {
-          case 'invoke':
-            void handleInvoke(ws, frame as unknown as InvokeFrame)
-            break
-          case 'ping':
-            sendFrame(ws, { type: 'pong', t: (frame as { t?: number }).t })
-            break
-          case 'pong':
-            // 心跳回应，lastSeen 已更新
-            break
-          default:
-            sendFrame(ws, { type: 'error', code: 'unknown_frame', message: `unknown frame type: ${String(frame.type)}` })
-        }
-      },
-      close(ws) {
-        allClients.delete(ws)
-        if (activeClient === ws) activeClient = null
-        cleanupClient(ws)
-        logger.info('ws client disconnected', { remaining: activeClient ? 1 : 0 })
-      },
-    },
+    switch (frame.type) {
+      case 'invoke':
+        void handleInvoke(ws, frame as unknown as InvokeFrame)
+        break
+      case 'ping':
+        sendFrame(ws, { type: 'pong', t: (frame as { t?: number }).t })
+        break
+      case 'pong':
+        // 心跳回应，lastSeen 已更新
+        break
+      default:
+        sendFrame(ws, { type: 'error', code: 'unknown_frame', message: `unknown frame type: ${String(frame.type)}` })
+    }
+  },
+  close: (ws: import('bun').ServerWebSocket<unknown>): void => {
+    allClients.delete(ws)
+    if (activeClient === ws) activeClient = null
+    cleanupClient(ws)
+    logger.info('ws client disconnected', { remaining: activeClient ? 1 : 0 })
+  },
+}
+
+// 额外 HTTPS 端口（与 HTTP 并存；语音输入 secure-context 需要）
+const TLS_EXTRA_PORT = Number(process.env.PROMA_WEB_TLS_PORT || 0)
+
+try {
+  serverRef = Bun.serve({
+    port: PORT,
+    hostname: HOST,
+    // 主端口默认 HTTP（兼容既有访问）；仅当未配置额外 TLS 端口时主端口才启用 TLS
+    ...(isTls && TLS_EXTRA_PORT === 0 ? { tls: tlsOptions } : {}),
+    fetch: fetchFn,
+    websocket: websocketConfig,
   })
 } catch (err) {
   const e = err as Error & { code?: string }
@@ -1328,9 +1658,26 @@ try {
   process.exit(1)
 }
 
+// 额外 HTTPS 端口（与 HTTP 并存；语音输入 secure-context 需要）
+if (TLS_EXTRA_PORT > 0) {
+  try {
+    tlsServerRef = Bun.serve({
+      port: TLS_EXTRA_PORT,
+      hostname: HOST,
+      tls: tlsOptions,
+      fetch: fetchFn,
+      websocket: websocketConfig,
+    })
+    logger.info('tls server started', { host: HOST, port: TLS_EXTRA_PORT })
+  } catch (err) {
+    const e = err as Error & { code?: string }
+    logger.error('failed to start tls server', { error: e?.message ?? String(err) })
+  }
+}
+
 scheduleHeartbeat()
 
-logger.info('server started', { host: HOST, port: PORT, ws: `/ws`, health: `/health` })
+logger.info('server started', { host: HOST, port: PORT, ws: `/ws`, health: `/health`, tls: isTls })
 console.log(`[server] Proma Web server → http://${HOST}:${PORT}`)
 console.log(`[server] WebSocket 桥: ws://${HOST}:${PORT}/ws`)
 console.log(`[server] 已注册通道数: ${registeredChannelCount}`)

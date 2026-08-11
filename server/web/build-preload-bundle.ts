@@ -30,6 +30,39 @@ const OUT_DIR = join(__dirname, '..', 'public')
 const SHARED_ENTRY = join(PROMA_SRC, 'packages/shared/src/index.ts')
 const TYPES_ENTRY = join(PROMA_SRC, 'apps/electron/src/types/index.ts')
 
+// ===== NAS 自更新 UI patch（追加到 bundle 末尾）=====
+// 桌面版 UpdateCard 在 available 状态只提供「前往下载」（openExternal GitHub），
+// NAS 版没有 GitHub 下载流程，需要把按钮改为「立即更新」直接触发 nas-updater:apply；
+// done 状态（映射为 downloaded）把「空闲时更新」改为「更新完成，请重启 Proma」。
+// 只注入 Web/NAS 版 bundle，桌面版无此文件，天然隔离。
+// 注意：不直接修改 React 管理的按钮 DOM（会导致 React diff 报错），
+//       available 状态用 document 捕获阶段拦截点击；done 为终态才允许改按钮。
+const NAS_UI_PATCH = `
+;(function () {
+  // === NAS 自更新 UI patch ===
+  if (!window.electronAPI || !window.electronAPI.updater) return
+  var nasStatus = 'idle'
+  try { window.electronAPI.updater.getStatus().then(function (s) { nasStatus = (s && s.status) || 'idle' }) } catch (e) {}
+  try { window.electronAPI.updater.onStatusChanged(function (s) { nasStatus = (s && s.status) || 'idle' }) } catch (e) {}
+  // 捕获阶段拦截（React 委托监听在冒泡阶段，这里先拦截不触发 React onClick）
+  document.addEventListener('click', function (e) {
+    var target = e.target
+    while (target && target !== document.body && target.tagName !== 'BUTTON') target = target.parentNode
+    if (!target || target.tagName !== 'BUTTON') return
+    var t = (target.textContent || '').trim()
+    if (nasStatus === 'available' && t.indexOf('前往下载') !== -1) {
+      e.preventDefault()
+      e.stopPropagation()
+      try { window.electronAPI.updater.installWhenIdle() } catch (err) {}
+    } else if (nasStatus === 'downloaded' && t.indexOf('空闲时更新') !== -1) {
+      e.preventDefault()
+      e.stopPropagation()
+      target.textContent = '更新完成，请重启 Proma'
+      target.disabled = true
+    }
+  }, true)
+})();
+`
 /** 拦截生成产物的两个失效 import，重定向到 Proma 源码 */
 const promaSrcRedirect = {
   name: 'proma-src-redirect',
@@ -68,6 +101,17 @@ async function main(): Promise<void> {
     }
     const out = result.outputs[0]
     console.log(`[build-preload-bundle] ✅ 已生成 ${out.path}`)
+    // 追加 NAS 自更新 UI patch（可在 bundle 后直接读取文件追加）
+    const { readFile, writeFile } = await import('node:fs/promises')
+    const bundlePath = out.path
+    let bundle = await readFile(bundlePath, 'utf8')
+    if (!bundle.includes('NAS 自更新 UI patch')) {
+      bundle += NAS_UI_PATCH
+      await writeFile(bundlePath, bundle, 'utf8')
+      console.log('[build-preload-bundle] ✅ 已追加 NAS 自更新 UI patch')
+    } else {
+      console.log('[build-preload-bundle] NAS 自更新 UI patch 已存在，跳过')
+    }
     const size = (await import('node:fs/promises')).stat(out.path).then((s) => s.size)
     console.log(`[build-preload-bundle] 大小: ${(await size / 1024).toFixed(1)} KB`)
   } catch (err) {

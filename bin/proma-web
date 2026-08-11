@@ -1,0 +1,55 @@
+#!/bin/bash
+# proma-web — Proma Web 启动包装脚本（fnOS fpk）
+# 未就绪时兜底同步准备；就绪后以 aij2022 用户启动 bun server。
+
+APP_DEST="${TRIM_APPDEST:-/vol1/@appcenter/proma}"
+PKGVAR="${TRIM_PKGVAR:-/vol1/@appdata/proma}"
+PROMA_SRC="${PKGVAR}/Proma"
+PORT="${TRIM_SERVICE_PORT:-1610}"
+
+export PROMA_SRC
+
+export PATH="${APP_DEST}/bin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin"
+# electron 二进制走 npmmirror 镜像（NAS 直连 GitHub 不可达；旁路由对 github TLS 不通）
+export ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"
+export electron_config_cache="${PKGVAR}/.electron-cache"
+export PROMA_WEB_HOST=0.0.0.0
+export PROMA_WEB_PORT="${PORT}"
+export PROMA_WEB_USER_DATA="${PKGVAR}/data"
+export PROMA_WEB_LOG_LEVEL=info
+export XDG_CONFIG_HOME="${PKGVAR}/config"
+export XDG_DATA_HOME="${PKGVAR}/data"
+export XDG_STATE_HOME="${PKGVAR}/state"
+export HOME="${PKGVAR}/home"
+
+# 语音输入 HTTPS（secure context 必需）：HTTP ${PORT} 保持兼容，HTTPS 1611 供语音
+# 证书随包内置（server/certs，有效期约 825 天，到期需重签）
+if [ -f "${APP_DEST}/server/certs/cert.pem" ] && [ -f "${APP_DEST}/server/certs/key.pem" ]; then
+  export PROMA_WEB_TLS_CERT="${APP_DEST}/server/certs/cert.pem"
+  export PROMA_WEB_TLS_KEY="${APP_DEST}/server/certs/key.pem"
+  export PROMA_WEB_TLS_PORT="1611"
+fi
+
+# 1. 未就绪则兜底准备（安装时若后台准备未完成，这里同步补齐）
+if [ ! -f "${PKGVAR}/.ready" ] || [ ! -d "${PROMA_SRC}/apps/electron/src/main" ]; then
+  echo "$(date '+%F %T') [proma-web] 检测到未就绪，执行准备..." >> "${PKGVAR}/proma.log"
+  bash "${APP_DEST}/bin/prepare-proma.sh" || {
+    echo "$(date '+%F %T') [proma-web] 准备失败，请查看 ${PKGVAR}/setup.log" >> "${PKGVAR}/proma.log"
+    exit 1
+  }
+fi
+
+# 2. token
+if [ -s "${PKGVAR}/proma.token" ]; then
+  export PROMA_WEB_TOKEN="$(cat "${PKGVAR}/proma.token")"
+else
+  echo "$(date '+%F %T') [proma-web] 缺少 token 文件 ${PKGVAR}/proma.token" >> "${PKGVAR}/proma.log"
+  exit 1
+fi
+
+# 3. 数据目录授权
+chown -R aij2022:Users "${PKGVAR}" 2>/dev/null || true
+
+# 4. 以 aij2022 运行（保持 opencode 一致的用户模型）
+cd "${APP_DEST}/server"
+exec runuser -u aij2022 -- "${APP_DEST}/bin/bun" run server.ts

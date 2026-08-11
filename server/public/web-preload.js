@@ -1742,17 +1742,19 @@
       return ipcRenderer.invoke(SYSTEM_PROMPT_IPC_CHANNELS.SET_DEFAULT, id);
     },
     updater: {
-      checkForUpdates: () => ipcRenderer.invoke("updater:check"),
-      getStatus: () => ipcRenderer.invoke("updater:get-status"),
+      checkForUpdates: () => ipcRenderer.invoke("nas-updater:check"),
+      getStatus: () => ipcRenderer.invoke("nas-updater:get-status").then(mapNasUpdateStatus),
       onStatusChanged: (callback) => {
-        const listener = (_event, status) => callback(status);
-        ipcRenderer.on("updater:status-changed", listener);
+        const listener = (_event, nasStatus) => {
+          callback(mapNasUpdateStatus(nasStatus));
+        };
+        ipcRenderer.on("nas-updater:status-changed", listener);
         return () => {
-          ipcRenderer.removeListener("updater:status-changed", listener);
+          ipcRenderer.removeListener("nas-updater:status-changed", listener);
         };
       },
-      installWhenIdle: () => ipcRenderer.invoke("updater:install-when-idle"),
-      cancelIdleInstall: () => ipcRenderer.invoke("updater:cancel-idle-install")
+      installWhenIdle: () => ipcRenderer.invoke("nas-updater:apply"),
+      cancelIdleInstall: () => Promise.resolve()
     },
     getLatestRelease: () => {
       return ipcRenderer.invoke(GITHUB_RELEASE_IPC_CHANNELS.GET_LATEST_RELEASE);
@@ -2191,4 +2193,49 @@
     }
   };
   contextBridge.exposeInMainWorld("electronAPI", electronAPI);
+  function mapNasUpdateStatus(nas) {
+    switch (nas && nas.status) {
+      case "idle":
+        return { status: "idle" };
+      case "checking":
+        return { status: "checking" };
+      case "available":
+        return { status: "available", version: nas.newVersion, releaseNotes: nas.releaseNotes };
+      case "building":
+        return { status: "downloading", version: "", progress: { percent: nas.progress || 0, transferred: 0, total: 100, bytesPerSecond: 0 } };
+      case "done":
+        return { status: "downloaded", version: nas.newVersion };
+      case "not-available":
+        return { status: "not-available" };
+      case "error":
+        return { status: "error", error: nas.error };
+      default:
+        return { status: "idle" };
+    }
+  }
+})();
+
+;(function () {
+  // === NAS 自更新 UI patch ===
+  if (!window.electronAPI || !window.electronAPI.updater) return
+  var nasStatus = 'idle'
+  try { window.electronAPI.updater.getStatus().then(function (s) { nasStatus = (s && s.status) || 'idle' }) } catch (e) {}
+  try { window.electronAPI.updater.onStatusChanged(function (s) { nasStatus = (s && s.status) || 'idle' }) } catch (e) {}
+  // 捕获阶段拦截（React 委托监听在冒泡阶段，这里先拦截不触发 React onClick）
+  document.addEventListener('click', function (e) {
+    var target = e.target
+    while (target && target !== document.body && target.tagName !== 'BUTTON') target = target.parentNode
+    if (!target || target.tagName !== 'BUTTON') return
+    var t = (target.textContent || '').trim()
+    if (nasStatus === 'available' && t.indexOf('前往下载') !== -1) {
+      e.preventDefault()
+      e.stopPropagation()
+      try { window.electronAPI.updater.installWhenIdle() } catch (err) {}
+    } else if (nasStatus === 'downloaded' && t.indexOf('空闲时更新') !== -1) {
+      e.preventDefault()
+      e.stopPropagation()
+      target.textContent = '更新完成，请重启 Proma'
+      target.disabled = true
+    }
+  }, true)
 })();
