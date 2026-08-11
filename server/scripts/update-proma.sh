@@ -52,7 +52,9 @@ restore_backup() {
     local old_commit
     old_commit="$(cat "${BACKUP_PATH}/commit.txt")"
     cd "${PROMA_SRC}"
+    git config core.filemode false 2>/dev/null || true
     git checkout . 2>/dev/null || true
+    git clean -fd -e node_modules -e .env -e .safe-key -e .patch-backup 2>/dev/null || true
     git checkout "${old_commit}" 2>/dev/null || log "回滚 checkout 失败（commit=${old_commit}）"
     rm -f "${PROMA_SRC}/.patch-applied"
     # 用更新前快照的 patch 备份覆盖（保证与备份时一致）
@@ -150,6 +152,17 @@ progress 25
 
 # ==================== 4. checkout 目标版本 ====================
 step "切换到目标版本 ${TARGET_COMMIT}"
+# 关键修复：NAS 文件系统会把所有文件标记为可执行（100644→100755），
+# git 的 core.filemode=true 误判为“全部文件被修改”导致 checkout 被拒（内容零差异）。
+# 1) 关闭 filemode 跟踪（根治 NAS 权限位误判）
+# 2) 丢弃已跟踪文件的改动（含文件模式变更 + patch 残留的真实内容修改）
+# 3) 清理 untracked 残留（排除依赖/敏感文件；node_modules/.env/.safe-key 均在 .gitignore）
+# 注意：这里不能只靠 patch undo——.patch-backup 缺失时 undo 失败，patch 修改过的文件
+#       （apps/electron/package.json、ipc.ts、preload/index.ts 等）会残留真实内容修改，
+#       必须用 git checkout -- . 从 index 强制恢复。
+git config core.filemode false >> "${LOG}" 2>&1 || true
+git checkout -- . >> "${LOG}" 2>&1 || { log "git checkout -- . 失败（工作树仍有冲突）"; exit 1; }
+git clean -fd -e node_modules -e .env -e .safe-key -e .proma-dev -e bunfig.toml -e .patch-backup >> "${LOG}" 2>&1 || true
 git checkout "${TARGET_COMMIT}" >> "${LOG}" 2>&1 || {
   log "git checkout ${TARGET_COMMIT} 失败，尝试 origin/main"
   git checkout origin/main >> "${LOG}" 2>&1 || {
